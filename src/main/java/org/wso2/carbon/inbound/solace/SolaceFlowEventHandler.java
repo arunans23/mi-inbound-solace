@@ -26,60 +26,65 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 
 /**
- * Logs JCSMP flow lifecycle events and reacts to terminal flow states.
- *
- * <p>Event handling:
- * <ul>
- *   <li>{@code FLOW_UP} — flow successfully bound; logged at INFO.</li>
- *   <li>{@code FLOW_ACTIVE} / {@code FLOW_INACTIVE} — for non-exclusive queues,
- *       signals whether this consumer is the active receiver; logged at INFO
- *       so operators can diagnose "why is my node silent?".</li>
- *   <li>{@code FLOW_RECONNECTING} / {@code FLOW_RECONNECTED} — transient flow
- *       reconnect (distinct from session-level reconnect); logged at WARN/INFO.</li>
- *   <li>{@code FLOW_DOWN} carrying a {@link JCSMPTransportException} — the channel dropped and JCSMP
- *       is reconnecting the session, after which it re-binds the flow; logged at WARN only. If the
- *       reconnect fails for good, JCSMP raises session {@code DOWN_ERROR}, which is handled as terminal.</li>
- *   <li>Any other {@code FLOW_DOWN} — terminal (queue deleted, permission revoked, broker rejected the
- *       bind). The supplied {@code onTerminalFailure} callback is invoked so the listener can tear
- *       itself down and ask the MI inbound framework to listen again.</li>
- * </ul>
+ * JCSMP flow event handler of one generation. It runs on JCSMP threads, returns at once and makes
+ * no JCSMP call. Events from a retired generation are ignored. A {@code FLOW_DOWN} carrying a
+ * {@link JCSMPTransportException} is transient, because JCSMP reconnects the session and binds the
+ * flow again. Any other {@code FLOW_DOWN} is terminal.
  */
 public class SolaceFlowEventHandler implements FlowEventHandler {
 
     private static final Log log = LogFactory.getLog(SolaceFlowEventHandler.class);
 
-    private final String listenerName;
-    private final Runnable onTerminalFailure;
+    private final SolaceEventListener listener;
+    private final Generation g;
+    private final int index;
 
-    public SolaceFlowEventHandler(String listenerName, Runnable onTerminalFailure) {
-        this.listenerName = listenerName;
-        this.onTerminalFailure = onTerminalFailure;
+    SolaceFlowEventHandler(SolaceEventListener listener, Generation generation, int index) {
+        this.listener = listener;
+        this.g = generation;
+        this.index = index;
     }
 
     @Override
     public void handleEvent(Object source, FlowEventArgs eventArgs) {
+        if (g != listener.current) {
+            if (log.isDebugEnabled()) {
+                log.debug("SolaceListener [" + listener.name + "] flow event from retired generation " + g.id
+                        + " ignored: " + eventArgs);
+            }
+            return;
+        }
         FlowEvent event = eventArgs.getEvent();
         if (event == FlowEvent.FLOW_UP) {
-            log.info("SolaceListener [" + listenerName + "] flow UP: " + eventArgs);
+            log.info("SolaceListener [" + listener.name + "] flow UP (generation " + g.id + "): " + eventArgs);
+            listener.health.flowUp(g, index);
         } else if (event == FlowEvent.FLOW_ACTIVE) {
-            log.info("SolaceListener [" + listenerName + "] flow ACTIVE "
-                    + "(now consuming on non-exclusive queue): " + eventArgs);
+            log.info("SolaceListener [" + listener.name + "] flow ACTIVE (now consuming on the endpoint, generation "
+                    + g.id + "): " + eventArgs);
+            listener.health.flowActivity(g, index, "active");
         } else if (event == FlowEvent.FLOW_INACTIVE) {
-            log.info("SolaceListener [" + listenerName + "] flow INACTIVE "
-                    + "(not active consumer on non-exclusive queue): " + eventArgs);
+            log.info("SolaceListener [" + listener.name + "] flow INACTIVE (standby on the endpoint, generation "
+                    + g.id + "): " + eventArgs);
+            listener.health.flowActivity(g, index, "standby");
         } else if (event == FlowEvent.FLOW_RECONNECTING) {
-            log.warn("SolaceListener [" + listenerName + "] flow reconnecting: " + eventArgs);
+            log.warn("SolaceListener [" + listener.name + "] flow reconnecting (generation " + g.id + "): "
+                    + eventArgs);
+            listener.health.flowReconnecting(g, index, true);
+            listener.discardParked(g, "flow reconnecting");
         } else if (event == FlowEvent.FLOW_RECONNECTED) {
-            log.info("SolaceListener [" + listenerName + "] flow reconnected: " + eventArgs);
+            log.info("SolaceListener [" + listener.name + "] flow reconnected (generation " + g.id + "): " + eventArgs);
+            listener.health.flowReconnecting(g, index, false);
         } else if (event == FlowEvent.FLOW_DOWN
                 && eventArgs.getException() instanceof JCSMPTransportException) {
-            log.warn("SolaceListener [" + listenerName + "] flow DOWN while the session reconnects: "
-                    + eventArgs + ". JCSMP will re-bind the flow.");
+            log.warn("SolaceListener [" + listener.name + "] flow DOWN while the session reconnects (generation "
+                    + g.id + "): " + eventArgs + ". JCSMP will re-bind the flow.");
+            listener.discardParked(g, "flow DOWN while the session reconnects");
         } else if (event == FlowEvent.FLOW_DOWN) {
-            log.error("SolaceListener [" + listenerName + "] flow DOWN (terminal): " + eventArgs);
-            onTerminalFailure.run();
+            log.error("SolaceListener [" + listener.name + "] flow DOWN (terminal, generation " + g.id + "): "
+                    + eventArgs);
+            listener.terminalFailure(g, "flow DOWN", eventArgs.getException());
         } else if (log.isDebugEnabled()) {
-            log.debug("SolaceListener [" + listenerName + "] flow event: " + eventArgs);
+            log.debug("SolaceListener [" + listener.name + "] flow event (generation " + g.id + "): " + eventArgs);
         }
     }
 }

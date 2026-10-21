@@ -17,39 +17,34 @@
  */
 package org.wso2.carbon.inbound.solace;
 
-import com.solacesystems.jcsmp.BytesXMLMessage;
-import com.solacesystems.jcsmp.ConsumerFlowProperties;
-import com.solacesystems.jcsmp.DurableTopicEndpoint;
-import com.solacesystems.jcsmp.Endpoint;
-import com.solacesystems.jcsmp.EndpointProperties;
-import com.solacesystems.jcsmp.FlowReceiver;
+import com.solacesystems.jcsmp.CapabilityType;
+import com.solacesystems.jcsmp.Context;
+import com.solacesystems.jcsmp.ContextProperties;
 import com.solacesystems.jcsmp.JCSMPChannelProperties;
 import com.solacesystems.jcsmp.JCSMPException;
 import com.solacesystems.jcsmp.JCSMPFactory;
 import com.solacesystems.jcsmp.JCSMPProperties;
 import com.solacesystems.jcsmp.JCSMPSession;
-import com.solacesystems.jcsmp.Queue;
-import com.solacesystems.jcsmp.XMLMessage;
 import com.solacesystems.jcsmp.XMLMessageConsumer;
-import com.solacesystems.jcsmp.XMLMessageListener;
+import com.solacesystems.jcsmp.XMLMessageProducer;
 
-import org.apache.commons.lang.BooleanUtils;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.synapse.SynapseException;
 import org.apache.synapse.core.SynapseEnvironment;
-import org.wso2.carbon.inbound.endpoint.protocol.PollingConstants;
 import org.wso2.carbon.inbound.endpoint.protocol.generic.GenericEventBasedConsumer;
+import org.wso2.carbon.inbound.solace.hooks.Hooks;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-
-import static org.wso2.carbon.inbound.solace.SolaceUtils.getBooleanProperty;
-import static org.wso2.carbon.inbound.solace.SolaceUtils.getIntProperty;
-import static org.wso2.carbon.inbound.solace.SolaceUtils.validateRequiredParam;
 
 /**
  * Solace inbound endpoint listener that consumes messages from a Solace Event Broker.
@@ -62,81 +57,29 @@ import static org.wso2.carbon.inbound.solace.SolaceUtils.validateRequiredParam;
  *   <li><b>TOPIC (Durable)</b> — Persistent topic delivery via a Durable Topic Endpoint (DTE).</li>
  * </ul>
  */
-public class SolaceEventListener extends GenericEventBasedConsumer implements XMLMessageListener {
+public class SolaceEventListener extends GenericEventBasedConsumer {
 
     private static final Log log = LogFactory.getLog(SolaceEventListener.class);
 
-    // JCSMP resources
-    private JCSMPSession session;
-    private FlowReceiver flowReceiver;
-    private XMLMessageConsumer xmlMessageConsumer;
+    enum State { STOPPED, CONNECTING, RUNNING, DRAINING, RECOVERING, FAILED }
 
-    // Message injection handler
-    private SolaceInjectHandler injectHandler;
-
-    // Lifecycle state — all access is synchronized on this instance
-    private volatile boolean isConnected = false;
-
-    // Counts the sessions created by listen(). A failure reported for an earlier session is stale.
-    private volatile int sessionGeneration = 0;
-    // Terminal failure handler of the current session, shared by its event handlers and onException.
-    private volatile Runnable onTerminalFailure = () -> { };
-
-    // Connection Configurations
-    private final String host;
-    private final String vpnName;
-    private final String username;
-    private final String apiProvidedUsername;
-    private final String password;
-    private final String clientName;
-    private final int connectRetries;
-    private final int connectRetriesPerHost;
-    private final int reconnectRetries;
-    private final int reconnectRetryWaitMillis;
-    private final int connectionTimeoutMillis;
-
-    // Authentication scheme
-    private final String authScheme;
-    private final String oauth2AccessToken;
-    private final String oauth2IssuerIdentifier;
-    private final String oidcIdToken;
-
-    // SSL/TLS Configurations
-    private final String sslTrustStorePath;
-    private final String sslTrustStorePassword;
-    private final String sslTrustStoreFormat;
-    private final String sslKeyStorePath;
-    private final String sslKeyStorePassword;
-    private final String sslKeyStoreFormat;
-    private final String sslKeyPassword;
-    private final boolean sslValidateCertificate;
-    private final boolean sslValidateCertificateDate;
-    private final boolean generateReceiveTimestamps;
-
-    // Destination Configurations
-    private final String destinationType;
-    private final String destinationName;
-    private final String subscriptionType;
-    private final String dteName;
-
-    // Consumer Behavior Configurations
-    private final boolean autoAck;
-    private final int subAckWindowSize;
-    private final String failureOutcome;
-    private final boolean binaryPayloadAsBase64;
-    private final String selector;
-
-    // Queue provisioning
-    private final boolean provisionDestination;
-    private final String queueAccessType;
-    private final String queuePermission;
-    private final int queueQuotaMB;
-    private final int queueMaxMsgSize;
-    private final boolean queueRespectTTL;
-    private final int queueMaxMsgRedelivery;
-
-    // Ingestion Configurations
-    private final String contentType;
+    final String name;
+    final SolaceInboundConfig config;
+    final Counters counters = new Counters();
+    final HealthReporter health;
+    private final Object lifecycleLock = new Object();
+    private State state = State.STOPPED;
+    volatile Generation current;
+    private int generationCounter = 0;
+    private volatile ScheduledThreadPoolExecutor lifecycleExecutor;
+    private volatile Closer closer;
+    private final String nodeId;
+    private final String nodeIdSource;
+    final SolaceInjectHandler injectHandler;
+    final OAuthTokenSource tokenSource;
+    private final AtomicBoolean loggedDirectNoSettle = new AtomicBoolean();
+    final AtomicBoolean loggedNonDmqReject = new AtomicBoolean();
+    final AtomicBoolean loggedDeliveryCountOff = new AtomicBoolean();
 
     /**
      * @param properties
@@ -153,386 +96,529 @@ public class SolaceEventListener extends GenericEventBasedConsumer implements XM
                                boolean coordination, boolean sequential) {
         super(properties, name, synapseEnvironment, injectingSeq, onErrorSeq,
                 coordination, sequential);
-
-        // Connection
-        this.host = properties.getProperty(SolaceInboundConstants.HOST);
-        this.vpnName = properties.getProperty(SolaceInboundConstants.VPN_NAME, "default");
-        this.username = properties.getProperty(SolaceInboundConstants.USERNAME);
-        this.apiProvidedUsername = properties.getProperty(SolaceInboundConstants.API_PROVIDED_USERNAME);
-        this.password = properties.getProperty(SolaceInboundConstants.PASSWORD);
-        this.clientName = properties.getProperty(SolaceInboundConstants.CLIENT_NAME);
-
-        // Authentication scheme
-        this.authScheme = properties.getProperty(
-                SolaceInboundConstants.AUTH_SCHEME,
-                SolaceInboundConstants.AUTH_SCHEME_BASIC);
-        this.oauth2AccessToken = properties.getProperty(SolaceInboundConstants.OAUTH2_ACCESS_TOKEN);
-        this.oauth2IssuerIdentifier = properties.getProperty(SolaceInboundConstants.OAUTH2_ISSUER_IDENTIFIER);
-        this.oidcIdToken = properties.getProperty(SolaceInboundConstants.OIDC_ID_TOKEN);
-
-        // Connection retry
-        this.connectionTimeoutMillis = getIntProperty(properties,
-                SolaceInboundConstants.CONNECTION_TIMEOUT, 30000);
-        this.connectRetries = getIntProperty(properties,
-                SolaceInboundConstants.CONNECT_RETRIES, 3);
-        this.connectRetriesPerHost = getIntProperty(properties,
-                SolaceInboundConstants.CONNECT_RETRIES_PER_HOST, 3);
-        this.reconnectRetries = getIntProperty(properties,
-                SolaceInboundConstants.RECONNECT_RETRIES, 3);
-        this.reconnectRetryWaitMillis = getIntProperty(properties,
-                SolaceInboundConstants.RECONNECT_RETRY_WAIT, 3000);
-
-        // SSL/TLS
-        this.sslTrustStorePath = properties.getProperty(SolaceInboundConstants.SSL_TRUST_STORE_PATH);
-        this.sslTrustStorePassword = properties.getProperty(SolaceInboundConstants.SSL_TRUST_STORE_PASSWORD);
-        this.sslTrustStoreFormat = properties.getProperty(SolaceInboundConstants.SSL_TRUST_STORE_FORMAT);
-        this.sslKeyStorePath = properties.getProperty(SolaceInboundConstants.SSL_KEY_STORE_PATH);
-        this.sslKeyStorePassword = properties.getProperty(SolaceInboundConstants.SSL_KEY_STORE_PASSWORD);
-        this.sslKeyStoreFormat = properties.getProperty(SolaceInboundConstants.SSL_KEY_STORE_FORMAT);
-        this.sslKeyPassword = properties.getProperty(SolaceInboundConstants.SSL_KEY_PASSWORD);
-        this.sslValidateCertificate = getBooleanProperty(properties,
-                SolaceInboundConstants.SSL_VALIDATE_CERTIFICATE, true);
-        this.sslValidateCertificateDate = getBooleanProperty(properties,
-                SolaceInboundConstants.SSL_VALIDATE_CERTIFICATE_DATE, true);
-        this.generateReceiveTimestamps = getBooleanProperty(properties,
-                SolaceInboundConstants.GENERATE_RECEIVE_TIMESTAMPS, false);
-
-        // Destination
-        this.destinationType = properties.getProperty(SolaceInboundConstants.DESTINATION_TYPE);
-        this.destinationName = properties.getProperty(SolaceInboundConstants.DESTINATION_NAME);
-        this.subscriptionType = properties.getProperty(
-                SolaceInboundConstants.SUBSCRIPTION_TYPE,
-                SolaceInboundConstants.SUBSCRIPTION_TYPE_DIRECT);
-        this.dteName = properties.getProperty(SolaceInboundConstants.DTE_NAME);
-
-        // Consumer behaviour
-        this.autoAck = getBooleanProperty(properties, SolaceInboundConstants.AUTO_ACK, true);
-        this.subAckWindowSize = getIntProperty(properties,
-                SolaceInboundConstants.SUB_ACK_WINDOW_SIZE, 255);
-        this.failureOutcome = properties.getProperty(
-                SolaceInboundConstants.FAILURE_OUTCOME,
-                SolaceInboundConstants.FAILURE_OUTCOME_NONE);
-        this.binaryPayloadAsBase64 = getBooleanProperty(properties,
-                SolaceInboundConstants.BINARY_PAYLOAD_AS_BASE64, false);
-        this.selector = properties.getProperty(SolaceInboundConstants.SELECTOR);
-
-        // Queue provisioning
-        this.provisionDestination = getBooleanProperty(properties,
-                SolaceInboundConstants.PROVISION_DESTINATION, false);
-        this.queueAccessType = properties.getProperty(
-                SolaceInboundConstants.QUEUE_ACCESS_TYPE,
-                SolaceInboundConstants.QUEUE_ACCESS_EXCLUSIVE);
-        this.queuePermission = properties.getProperty(
-                SolaceInboundConstants.QUEUE_PERMISSION);
-        this.queueQuotaMB = getIntProperty(properties,
-                SolaceInboundConstants.QUEUE_QUOTA_MB, 0);
-        this.queueMaxMsgSize = getIntProperty(properties,
-                SolaceInboundConstants.QUEUE_MAX_MSG_SIZE, 0);
-        this.queueRespectTTL = getBooleanProperty(properties,
-                SolaceInboundConstants.QUEUE_RESPECT_TTL, false);
-        this.queueMaxMsgRedelivery = getIntProperty(properties,
-                SolaceInboundConstants.QUEUE_MAX_MSG_REDELIVERY, 0);
-
-        // Ingestion
-        this.contentType = properties.getProperty(SolaceInboundConstants.CONTENT_TYPE);
-
-        // Execution behaviour
-        this.sequential = BooleanUtils.toBooleanDefaultIfNull(
-                BooleanUtils.toBooleanObject(
-                        properties.getProperty(PollingConstants.INBOUND_ENDPOINT_SEQUENTIAL)),
-                sequential);
-        this.coordination = BooleanUtils.toBooleanDefaultIfNull(
-                BooleanUtils.toBooleanObject(
-                        properties.getProperty(PollingConstants.INBOUND_COORDINATION)),
-                coordination);
-
-        // Client-acknowledgement settles each message based on the mediation outcome, which is
-        // only known synchronously. Under async injection (sequential=false) the listener's
-        // post-injection ack would run before mediation, then a connector operation acknowledgeMessage /
-        // nackMessage could settle the same message from a worker thread. Solace treats a second
-        // ack as a harmless no-op, but an ack followed by a nack is not: the message is already
-        // removed as consumed, so the intended FAILED/REJECTED (redelivery / DMQ routing) outcome
-        // is silently lost. Force sequential processing so the settle decision is always made from
-        // a completed mediation. (Matches other MI inbounds — e.g. Kafka — which also pin
-        // sequential for manual-commit/ack modes.)
-        if (!autoAck && !this.sequential) {
-            log.warn("SolaceListener [" + name + "]: autoAck=false requires sequential processing; "
-                    + "overriding sequential=true to prevent an ack-then-nack double-settle race.");
-            this.sequential = true;
-        }
+        this.name = name;
+        this.config = SolaceInboundConfig.parse(properties, name, coordination, sequential);
+        this.sequential = config.sequential;
+        this.coordination = config.coordination;
+        ClientNames.NodeId node = ClientNames.nodeId();
+        this.nodeId = node.id;
+        this.nodeIdSource = node.source;
+        this.injectHandler = new SolaceInjectHandler(injectingSeq, onErrorSeq, synapseEnvironment, true,
+                config.contentType, config.binaryPayloadAsBase64, name);
+        this.tokenSource = new OAuthTokenSource(config.oauth2TokenFile, config.oauth2AccessToken, name);
+        this.health = new HealthReporter(this);
     }
 
     @Override
-    public synchronized void listen() {
-        if (isConnected && session != null && !session.isClosed()) {
-            if (log.isDebugEnabled()) {
-                log.debug("SolaceListener [" + name + "] already connected, "
-                        + "skipping re-initialisation.");
+    public void listen() {
+        List<String> errors = new ArrayList<>(config.errors);
+        if (!config.autoAck && config.direct && loggedDirectNoSettle.compareAndSet(false, true)) {
+            log.info("SolaceListener [" + name + "] Direct topic with autoAck=false: the settlement decision bounds "
+                    + "the work but nothing is settled on a Direct topic");
+        }
+        String guard = VersionGuard.check(synapseEnvironment, name);
+        if (guard != null) {
+            errors.add(guard);
+        }
+        if (!errors.isEmpty()) {
+            synchronized (lifecycleLock) {
+                if (state == State.STOPPED || state == State.FAILED) {
+                    state = State.FAILED;
+                    health.lifecycle(state);
+                    log.error("SolaceListener [" + name + "] cannot start: " + String.join("; ", errors));
+                    health.lastError(String.join("; ", errors));
+                }
             }
             return;
         }
+        if (!config.autoAck) {
+            SequenceWalker.warnIfNoSettlementOperation(synapseEnvironment, name, injectingSeq, onErrorSeq,
+                    config.settlementTimeoutMillis);
+        }
+        if (config.transacted) {
+            if (properties.containsKey(SolaceInboundConstants.MAX_REDELIVERIES)) {
+                log.warn("SolaceListener [" + name + "] solace.maxRedeliveries is ignored in transacted mode; the "
+                        + "queue's maximum redelivery count and DMQ are the cutoff");
+            }
+            log.warn("SolaceListener [" + name + "] transacted mode relies on the queue's maximum redelivery count, "
+                    + "a DMQ and max delivered unacknowledged messages per flow set to 1 for poison messages; this "
+                    + "endpoint cannot verify the queue's settings through JCSMP, and provisioning with 'ignore "
+                    + "already exists' does not change an existing queue; confirm them on the broker");
+        }
+        if (config.clientNameStrict) {
+            // Strict mode sends the name verbatim, as 1.x did, and a duplicate name loops on evictions (A43).
+            log.warn("SolaceListener [" + name + "] clientNameStrict=true: the client name '" + config.clientName
+                    + "' is sent as is; a second session with this name on the broker evicts this one and the two "
+                    + "evict each other in turn; keep it unique per node");
+        }
+        Generation generation;
+        Hooks.get().point("listen.beforeTransition", this);
+        synchronized (lifecycleLock) {
+            if (state != State.STOPPED && state != State.FAILED) {
+                if (log.isDebugEnabled()) {
+                    log.debug("SolaceListener [" + name + "] listen() ignored, state=" + state);
+                }
+                return;
+            }
+            if (lifecycleExecutor == null || lifecycleExecutor.isShutdown()) {
+                lifecycleExecutor = newLifecycleExecutor();
+            }
+            if (closer == null || closer.exiting) {
+                closer = new Closer(name, health);
+            }
+            state = State.CONNECTING;
+            generation = new Generation(++generationCounter, lifecycleExecutor, closer, config);
+            current = generation;
+            health.lifecycle(state);
+            final Generation submitted = generation;
+            try {
+                submitted.lifecycleExecutor.execute(() -> connect(submitted, 1));
+            } catch (RejectedExecutionException e) {
+                retire(submitted);
+                state = State.STOPPED;
+                health.lifecycle(state);
+                log.error("SolaceListener [" + name + "] could not submit the connect of generation " + submitted.id
+                        + ": lifecycle executor shut down");
+                return;
+            }
+        }
+        log.info("SolaceListener [" + name + "] starting generation " + generation.id + " (node id " + nodeId + " from "
+                + nodeIdSource + ", settlementTimeout " + config.settlementTimeoutMillis + " ms from "
+                + config.settlementTimeoutSource + ", concurrentConsumers " + config.concurrentConsumers
+                + ", window " + config.highWaterMark + "/" + config.lowWaterMark + ", coordination " + coordination
+                + ")");
+    }
 
+    private ScheduledThreadPoolExecutor newLifecycleExecutor() {
+        ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1,
+                new NamedThreadFactory("solace-lifecycle-" + name, true));
+        executor.setRemoveOnCancelPolicy(true);
+        executor.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
+        return executor;
+    }
+
+    void connect(Generation generation, int attempt) {
+        synchronized (lifecycleLock) {
+            if (generation.retired) {
+                return;
+            }
+            generation.claimed = true;
+        }
         try {
-            validateConnectionParameters();
-
-            int generation = ++sessionGeneration;
-            AtomicBoolean handled = new AtomicBoolean(false);
-            onTerminalFailure = () -> handleTerminalFailure(generation, handled);
-            session = JCSMPFactory.onlyInstance().createSession(
-                    buildJCSMPProperties(), null,
-                    new SolaceSessionEventHandler(name, onTerminalFailure));
-            session.connect();
-            isConnected = true;
-
-            injectHandler = new SolaceInjectHandler(
-                    injectingSeq, onErrorSeq, synapseEnvironment, sequential,
-                    contentType, binaryPayloadAsBase64, name);
-
-            initializeConsumer();
-
-            log.info("SolaceListener [" + name + "] started successfully. "
-                    + "Type=" + destinationType + ", Destination=" + destinationName);
-
-        } catch (JCSMPException e) {
-            cleanupSessionQuietly();
-            log.error("Failed to initialise SolaceListener [" + name + "]", e);
-            throw new SynapseException(
-                    "Failed to initialise SolaceListener [" + name + "]", e);
-        } catch (SynapseException e) {
-            cleanupSessionQuietly();
-            log.error("Failed to initialise SolaceListener [" + name + "]", e);
+            Hooks.get().point("connect.beforeBuild", generation);
+            buildResources(generation);
+            Hooks.get().point("connect.beforeBarrier", generation);
+            synchronized (lifecycleLock) {
+                if (generation.retired || (state != State.CONNECTING && state != State.RECOVERING)) {
+                    generation.closer.submit(generation, () -> closeAll(generation));
+                    return;
+                }
+                state = State.RUNNING;
+                generation.active = true;
+                health.lifecycle(state);
+                health.connected(generation);
+                counters.currentGeneration(generation);
+                try {
+                    generation.binding.start();
+                } catch (JCSMPException e) {
+                    generation.active = false;
+                    throw e;
+                }
+            }
+            log.info("SolaceListener [" + name + "] generation " + generation.id + " started: "
+                    + generation.binding.describe());
+        } catch (Exception e) {
+            generation.closer.submit(generation, () -> closeAll(generation));
+            synchronized (lifecycleLock) {
+                if (generation.retired) {
+                    return;
+                }
+                generation.retired = true;
+                generation.active = false;
+                if (e instanceof ConfigurationFailure) {
+                    state = State.FAILED;
+                    health.lifecycle(state);
+                    health.lastError(e);
+                    log.error("SolaceListener [" + name + "] cannot start: " + e.getMessage());
+                    return;
+                }
+                if (config.recoveryMaxAttempts >= 0 && attempt >= config.recoveryMaxAttempts) {
+                    state = State.FAILED;
+                    health.lifecycle(state);
+                    health.lastError(e);
+                    log.error("SolaceListener [" + name + "] connection attempt " + attempt
+                            + " failed and the retry budget is exhausted; the endpoint is FAILED until it is "
+                            + "resumed or redeployed", e);
+                    return;
+                }
+                long delay = DeliveryProcessor.backoff(config.recoveryInitialDelayMillis, config.recoveryProgression,
+                        config.recoveryMaxDelayMillis, attempt);
+                state = State.RECOVERING;
+                health.lifecycle(state);
+                health.lastError(e);
+                log.warn("SolaceListener [" + name + "] connection attempt " + attempt + " failed; next attempt in "
+                        + delay + " ms: " + e.getMessage(), e);
+                Generation next = new Generation(++generationCounter, generation.lifecycleExecutor, generation.closer,
+                        config);
+                current = next;
+                next.scheduled = next.lifecycleExecutor.schedule(() -> connect(next, attempt + 1), delay,
+                        TimeUnit.MILLISECONDS);
+            }
+        } catch (Error e) {
+            generation.closer.submit(generation, () -> closeAll(generation));
+            synchronized (lifecycleLock) {
+                if (!generation.retired) {
+                    generation.retired = true;
+                    generation.active = false;
+                    state = State.FAILED;
+                    health.lifecycle(state);
+                    health.lastError(e);
+                }
+            }
+            log.error("SolaceListener [" + name + "] generation " + generation.id
+                    + " build failed with an error; the endpoint is FAILED until it is resumed or redeployed", e);
             throw e;
         }
     }
 
-    public synchronized void pause() {
-        log.info("Pausing SolaceListener [" + name + "]...");
-        destroy();
+    void terminalFailure(Generation generation, String what, Exception cause) {
+        if (generation != current) {
+            if (log.isDebugEnabled()) {
+                log.debug("SolaceListener [" + name + "] " + what + " from retired generation " + generation.id
+                        + " ignored");
+            }
+            return;
+        }
+        health.lastError(what + (cause != null ? ": " + cause.getMessage() : ""));
+        try {
+            generation.lifecycleExecutor.execute(() -> recover(generation));
+        } catch (RejectedExecutionException e) {
+            if (log.isDebugEnabled()) {
+                log.debug("SolaceListener [" + name + "] recovery of generation " + generation.id
+                        + " not submitted: lifecycle executor shut down");
+            }
+        }
     }
 
-    public synchronized void resume() {
-        if (!isConnected) {
-            log.info("Resuming SolaceListener [" + name + "]...");
-            listen();
+    // A parked message belongs to the flow that delivered it. Once that flow leaves the connected state the broker
+    // redelivers every unacknowledged message on the rebind, so the parked copies are stale (A44). JCSMP thread,
+    // no JCSMP call. stopped is left as it is, the next worker that finishes restarts the flow (1.7).
+    void discardParked(Generation generation, String why) {
+        int parked;
+        synchronized (generation.admission) {
+            parked = generation.pending.size();
+            if (parked == 0) {
+                return;
+            }
+            generation.pending.clear();
+            counters.dropped.add(parked);
+            counters.gauge(generation).pending.set(0);
         }
+        log.info("SolaceListener [" + name + "] discarded " + parked + " parked messages on " + why + " (generation "
+                + generation.id + "): the broker redelivers them after the rebind");
+    }
+
+    void recover(Generation generation) {
+        synchronized (lifecycleLock) {
+            if (current != generation || generation.retired || state != State.RUNNING) {
+                return;
+            }
+            state = State.RECOVERING;
+            health.lifecycle(state);
+        }
+        log.warn("SolaceListener [" + name + "] generation " + generation.id + " is recovering: draining up to "
+                + config.drainTimeoutMillis + " ms");
+        DrainController.drain(this, generation, System.currentTimeMillis() + config.drainTimeoutMillis);
+        Hooks.get().point("recover.afterDrain", generation);
+        synchronized (lifecycleLock) {
+            if (current != generation || !retire(generation)) {
+                return;
+            }
+        }
+        generation.closer.submit(generation, () -> closeAll(generation));
+        Generation next;
+        synchronized (lifecycleLock) {
+            if (current != generation || state != State.RECOVERING) {
+                return;
+            }
+            state = State.CONNECTING;
+            health.lifecycle(state);
+            next = new Generation(++generationCounter, generation.lifecycleExecutor, generation.closer, config);
+            current = next;
+        }
+        connect(next, 1);
+    }
+
+    private boolean retire(Generation generation) {
+        if (generation.retired) {
+            return false;
+        }
+        generation.retired = true;
+        generation.active = false;
+        ExecutorService workers = generation.workers;
+        if (workers != null) {
+            workers.shutdown();
+        }
+        if (generation.scheduled != null) {
+            generation.scheduled.cancel(false);
+        }
+        if (!generation.claimed) {
+            generation.closer.detach(generation);
+        }
+        return true;
+    }
+
+    public void pause() {
+        Generation generation;
+        synchronized (lifecycleLock) {
+            if (state == State.STOPPED || state == State.FAILED) {
+                return;
+            }
+            generation = current;
+            if (!generation.active) {
+                retire(generation);
+                state = State.STOPPED;
+                health.lifecycle(state);
+                log.info("SolaceListener [" + name + "] stopped while generation " + generation.id
+                        + " was connecting; the attempt closes what it built");
+                return;
+            }
+            state = State.DRAINING;
+            health.lifecycle(state);
+        }
+        log.info("SolaceListener [" + name + "] pausing: draining generation " + generation.id + " for up to "
+                + config.drainTimeoutMillis + " ms");
+        DrainController.drain(this, generation, System.currentTimeMillis() + config.drainTimeoutMillis);
+        Hooks.get().point("pause.afterDrain", generation);
+        boolean owner;
+        synchronized (lifecycleLock) {
+            if (current != generation) {
+                return;
+            }
+            owner = retire(generation);
+            state = State.STOPPED;
+            health.lifecycle(state);
+        }
+        if (owner) {
+            generation.closer.submit(generation, () -> closeAll(generation));
+        }
+        log.info("SolaceListener [" + name + "] paused; generation " + generation.id
+                + " is closing on the closer thread");
+    }
+
+    public void resume() {
+        listen();
     }
 
     @Override
-    public synchronized void destroy() {
-        if (!isConnected) {
-            return;
+    public void destroy() {
+        ScheduledThreadPoolExecutor capturedExecutor;
+        Closer capturedCloser;
+        synchronized (lifecycleLock) {
+            capturedExecutor = lifecycleExecutor;
+            capturedCloser = closer;
         }
-        log.info("Destroying SolaceListener [" + name + "]...");
+        pause();
+        synchronized (lifecycleLock) {
+            if (state != State.STOPPED && state != State.FAILED) {
+                log.info("SolaceListener [" + name + "] destroy found the endpoint resumed; executors kept");
+                return;
+            }
+            if (capturedExecutor != null && capturedExecutor == lifecycleExecutor) {
+                capturedExecutor.shutdown();
+            }
+            if (capturedCloser != null && capturedCloser == closer) {
+                capturedCloser.exitWhenDetached();
+            }
+        }
+        log.info("SolaceListener [" + name + "] destroyed (lifecycle executor shut down; closer exits after its "
+                + "last close)");
+    }
+
+    void closeAll(Generation generation) {
+        long startedAt = System.currentTimeMillis();
+        int failures = 0;
         try {
-            if (flowReceiver != null) {
-                flowReceiver.close();
-                flowReceiver = null;
+            for (TxWorker txWorker : generation.txWorkers) {
+                try {
+                    txWorker.closeResources();
+                } catch (Exception e) {
+                    failures++;
+                    log.warn("SolaceListener [" + name + "] error while closing generation " + generation.id
+                            + " (transacted worker " + txWorker.index + ")", e);
+                }
             }
-            if (xmlMessageConsumer != null) {
-                xmlMessageConsumer.close();
-                xmlMessageConsumer = null;
+            try {
+                XMLMessageProducer parentProducer = generation.parentProducer;
+                if (parentProducer != null) {
+                    parentProducer.close();
+                }
+            } catch (Exception e) {
+                failures++;
+                log.warn("SolaceListener [" + name + "] error while closing generation " + generation.id
+                        + " (parent producer)", e);
             }
-            if (session != null && !session.isClosed()) {
-                session.closeSession();
-                session = null;
+            try {
+                ConsumerBinding binding = generation.binding;
+                if (binding != null) {
+                    binding.close();
+                }
+            } catch (Exception e) {
+                failures++;
+                log.warn("SolaceListener [" + name + "] error while closing generation " + generation.id
+                        + " (binding)", e);
             }
-        } catch (Exception e) {
-            log.warn("Error during SolaceListener [" + name + "] shutdown", e);
+            try {
+                XMLMessageConsumer reconnectGuard = generation.reconnectGuard;
+                if (reconnectGuard != null) {
+                    reconnectGuard.close();
+                }
+            } catch (Exception e) {
+                // Quiet by A41 item 4. The session close that follows closes this consumer as well.
+            }
+            try {
+                JCSMPSession session = generation.session;
+                if (session != null && !session.isClosed()) {
+                    session.closeSession();
+                }
+            } catch (Exception e) {
+                failures++;
+                log.warn("SolaceListener [" + name + "] error while closing generation " + generation.id
+                        + " (session)", e);
+            }
+            try {
+                Context context = generation.context;
+                if (context != null) {
+                    context.destroy();
+                }
+            } catch (Exception e) {
+                failures++;
+                log.warn("SolaceListener [" + name + "] error while closing generation " + generation.id
+                        + " (context)", e);
+            }
+            ExecutorService workers = generation.workers;
+            if (workers != null) {
+                workers.shutdown();
+            }
+        } finally {
+            generation.closer.detach(generation);
         }
-        isConnected = false;
-        log.info("SolaceListener [" + name + "] destroyed.");
+        log.info("SolaceListener [" + name + "] generation " + generation.id
+                + (failures == 0 ? " closed in " : " closed with " + failures + " failure(s) in ")
+                + (System.currentTimeMillis() - startedAt) + " ms");
     }
 
-    /**
-     * Tears down a partially initialised listener — closes the session if open and
-     * resets all lifecycle state (isConnected, session, flowReceiver, consumer).
-     * Used when listen() fails after session.connect() but before the listener is
-     * fully wired.
-     */
-    private void cleanupSessionQuietly() {
-        try {
-            if (session != null && !session.isClosed()) {
-                session.closeSession();
-            }
-        } catch (Exception e) {
-            log.debug("Error closing session during cleanup", e);
-        }
-        session = null;
-        isConnected = false;
-        flowReceiver = null;
-        xmlMessageConsumer = null;
+    public Map<String, Object> getHealth() {
+        return health.snapshot();
     }
 
-    private void initializeQueueConsumer() throws JCSMPException {
-        validateRequiredParam(destinationName, SolaceInboundConstants.DESTINATION_NAME,
-                SolaceInboundConstants.DESTINATION_TYPE_QUEUE);
-        Queue queue = JCSMPFactory.onlyInstance().createQueue(destinationName);
-
-        if (provisionDestination) {
-            session.provision(queue, buildEndpointProperties(),
-                    JCSMPSession.FLAG_IGNORE_ALREADY_EXISTS);
+    private void buildResources(Generation generation) throws JCSMPException {
+        ContextProperties contextProperties = new ContextProperties();
+        contextProperties.setName("solace-" + name + "-g" + generation.id);
+        generation.context = JCSMPFactory.onlyInstance().createContext(contextProperties);
+        JCSMPProperties sessionProperties = buildJCSMPProperties(generation);
+        SolaceSessionEventHandler sessionHandler = new SolaceSessionEventHandler(this, generation);
+        generation.sessionHandler = sessionHandler;
+        generation.session = JCSMPFactory.onlyInstance().createSession(sessionProperties, generation.context,
+                sessionHandler);
+        generation.session.connect();
+        if (StringUtils.isNotBlank(config.sharedSubscriptionGroup)
+                && !generation.session.isCapable(CapabilityType.SHARED_SUBSCRIPTIONS)) {
+            throw new ConfigurationFailure("solace.sharedSubscriptionGroup='" + config.sharedSubscriptionGroup
+                    + "' is set but the broker does not report the SHARED_SUBSCRIPTIONS capability; remove the "
+                    + "parameter or upgrade the broker");
         }
-
-        ConsumerFlowProperties flowProps = buildFlowProperties(queue);
-        flowReceiver = session.createFlow(this, flowProps, null,
-                new SolaceFlowEventHandler(name, onTerminalFailure));
-        flowReceiver.start();
-        log.info("SolaceListener [" + name + "] consuming from queue: " + destinationName);
-    }
-
-    /**
-     * Subscribes to one or more topics (comma-separated in destinationName).
-     */
-    private void initializeTopicConsumer() throws JCSMPException {
-        validateRequiredParam(destinationName, SolaceInboundConstants.DESTINATION_NAME,
-                SolaceInboundConstants.DESTINATION_TYPE_TOPIC);
-
-        List<String> topics = new ArrayList<>();
-        for (String topicStr : destinationName.split(",")) {
-            String trimmed = topicStr.trim();
-            if (!trimmed.isEmpty()) {
-                topics.add(trimmed);
-            }
+        if (!config.direct) {
+            // Never started and without a subscription. It only carries the reconnect handler to JCSMP (A41).
+            // A Direct endpoint registers the same handler with its own consumer in DirectTopicBinding.bind.
+            generation.reconnectGuard = generation.session.getMessageConsumer(sessionHandler);
         }
-        if (topics.isEmpty()) {
-            throw new SynapseException("Parameter '" + SolaceInboundConstants.DESTINATION_NAME
-                    + "' for " + SolaceInboundConstants.DESTINATION_TYPE_TOPIC
-                    + " must contain at least one non-empty topic.");
+        generation.workers = Executors.newFixedThreadPool(config.concurrentConsumers, new NamedThreadFactory(
+                (config.transacted ? "solace-txworker-" : "solace-worker-") + name + "-" + generation.id + "-"));
+        if (config.transacted) {
+            generation.parentProducer = generation.session.getMessageProducer(
+                    new TxPublishEventHandler(this, generation, 0));
         }
-
-        xmlMessageConsumer = session.getMessageConsumer(this);
-
-        for (String topic : topics) {
-            session.addSubscription(JCSMPFactory.onlyInstance().createTopic(topic));
-            log.info("SolaceListener [" + name + "] subscribed to topic: " + topic);
-        }
-
-        xmlMessageConsumer.start();
-    }
-
-    private void initializeDurableTopicConsumer() throws JCSMPException {
-        String context = SolaceInboundConstants.DESTINATION_TYPE_TOPIC
-                + " + " + SolaceInboundConstants.SUBSCRIPTION_TYPE_DURABLE;
-        validateRequiredParam(destinationName, SolaceInboundConstants.DESTINATION_NAME, context);
-        validateRequiredParam(dteName, SolaceInboundConstants.DTE_NAME, context);
-
-        DurableTopicEndpoint dte = (DurableTopicEndpoint) JCSMPFactory.onlyInstance()
-                .createDurableTopicEndpointEx(dteName);
-
-        if (provisionDestination) {
-            session.provision(dte, buildEndpointProperties(),
-                    JCSMPSession.FLAG_IGNORE_ALREADY_EXISTS);
-        }
-
-        ConsumerFlowProperties flowProps = buildFlowProperties(dte);
-        flowProps.setNewSubscription(
-                JCSMPFactory.onlyInstance().createTopic(destinationName));
-        flowReceiver = session.createFlow(this, flowProps, null,
-                new SolaceFlowEventHandler(name, onTerminalFailure));
-        flowReceiver.start();
-        log.info("SolaceListener [" + name + "] consuming from DTE: " + dteName
-                + ", subscription: " + destinationName);
-    }
-
-    private void initializeConsumer() throws JCSMPException {
-        if (SolaceInboundConstants.DESTINATION_TYPE_QUEUE
-                .equalsIgnoreCase(destinationType)) {
-            initializeQueueConsumer();
-        } else if (SolaceInboundConstants.DESTINATION_TYPE_TOPIC
-                .equalsIgnoreCase(destinationType)
-                && SolaceInboundConstants.SUBSCRIPTION_TYPE_DURABLE
-                .equalsIgnoreCase(subscriptionType)) {
-            initializeDurableTopicConsumer();
-        } else if (SolaceInboundConstants.DESTINATION_TYPE_TOPIC
-                .equalsIgnoreCase(destinationType)) {
-            initializeTopicConsumer();
+        generation.binding = config.transacted ? new TransactedBinding(this, generation)
+                : ConsumerBinding.create(this, generation);
+        health.bound(generation, config.transacted ? config.concurrentConsumers : 1, config.direct);
+        if (config.transacted) {
+            // There is no dispatcher in transacted mode. Each worker receives synchronously on its own flow (2.2).
+            generation.binding.bind(null, null);
         } else {
-            throw new SynapseException(
-                    "Unsupported destinationType: '" + destinationType
-                    + "'. Valid values: QUEUE, TOPIC.");
+            generation.binding.bind(new Dispatcher(this, generation),
+                    new SolaceFlowEventHandler(this, generation, 1));
         }
     }
 
-    /**
-     * Validates required connection/auth inputs before a session is created, so missing values
-     * fail fast with an actionable SynapseException instead of a generic JCSMP error (or, for a
-     * null BASIC username, an NPE during SMF login-frame build).
-     */
-    private void validateConnectionParameters() {
-        validateRequiredParam(host, SolaceInboundConstants.HOST, "Solace connection");
-
-        if (SolaceInboundConstants.AUTH_SCHEME_OAUTH2.equalsIgnoreCase(authScheme)) {
-            if (StringUtils.isBlank(oauth2AccessToken) && StringUtils.isBlank(oidcIdToken)) {
-                throw new SynapseException("OAUTH2 authentication requires either '"
-                        + SolaceInboundConstants.OAUTH2_ACCESS_TOKEN + "' or '"
-                        + SolaceInboundConstants.OIDC_ID_TOKEN + "'.");
-            }
-        } else if (SolaceInboundConstants.AUTH_SCHEME_CLIENT_CERTIFICATE.equalsIgnoreCase(authScheme)) {
-            validateRequiredParam(sslKeyStorePath, SolaceInboundConstants.SSL_KEY_STORE_PATH,
-                    "CLIENT_CERTIFICATE authentication");
-        } else {
-            // BASIC (default). A null username NPEs in JCSMP during login-frame build; password is
-            // left to the broker to reject, since some setups allow username-only authentication.
-            validateRequiredParam(username, SolaceInboundConstants.USERNAME, "BASIC authentication");
-        }
-    }
-
-    private JCSMPProperties buildJCSMPProperties() {
+    private JCSMPProperties buildJCSMPProperties(Generation generation) {
         JCSMPProperties props = new JCSMPProperties();
 
         // Core connection
-        props.setProperty(JCSMPProperties.HOST, host);
-        props.setProperty(JCSMPProperties.VPN_NAME, vpnName);
-        props.setProperty(JCSMPProperties.USERNAME, username);
-        props.setProperty(JCSMPProperties.PASSWORD, password);
+        props.setProperty(JCSMPProperties.HOST, config.host);
+        props.setProperty(JCSMPProperties.VPN_NAME, config.vpnName);
+        props.setProperty(JCSMPProperties.USERNAME, config.username);
+        props.setProperty(JCSMPProperties.PASSWORD, config.password);
 
-        if (StringUtils.isNotBlank(clientName)) {
+        String clientName = ClientNames.inbound(config.clientName, nodeId, name, config.clientNameStrict);
+        if (clientName != null) {
             props.setProperty(JCSMPProperties.CLIENT_NAME, clientName);
         }
 
         // Authentication scheme
         applyAuthScheme(props);
+        props.setBooleanProperty(JCSMPProperties.REAPPLY_SUBSCRIPTIONS, true);
 
         // Connection retry
         JCSMPChannelProperties channelProps = (JCSMPChannelProperties)
                 props.getProperty(JCSMPProperties.CLIENT_CHANNEL_PROPERTIES);
-        channelProps.setConnectTimeoutInMillis(connectionTimeoutMillis);
-        channelProps.setConnectRetries(connectRetries);
-        channelProps.setConnectRetriesPerHost(connectRetriesPerHost);
-        channelProps.setReconnectRetries(reconnectRetries);
-        channelProps.setReconnectRetryWaitInMillis(reconnectRetryWaitMillis);
+        channelProps.setConnectTimeoutInMillis(config.connectionTimeoutMillis);
+        channelProps.setConnectRetries(config.connectRetries);
+        channelProps.setConnectRetriesPerHost(config.connectRetriesPerHost);
+        channelProps.setReconnectRetries(config.reconnectRetries);
+        channelProps.setReconnectRetryWaitInMillis(config.reconnectRetryWaitMillis);
+        if (config.compressionLevel > 0) {
+            channelProps.setCompressionLevel(config.compressionLevel);
+        }
+        if (config.keepAliveIntervalMillis >= 0) {
+            channelProps.setKeepAliveIntervalInMillis((int) config.keepAliveIntervalMillis);
+        }
+        if (config.keepAliveLimit >= 0) {
+            channelProps.setKeepAliveLimit(config.keepAliveLimit);
+        }
 
         // Transport window size
-        props.setProperty(JCSMPProperties.SUB_ACK_WINDOW_SIZE, subAckWindowSize);
+        props.setProperty(JCSMPProperties.SUB_ACK_WINDOW_SIZE, config.subAckWindowSize);
 
-        props.setProperty(JCSMPProperties.GENERATE_RCV_TIMESTAMPS, generateReceiveTimestamps);
+        props.setProperty(JCSMPProperties.GENERATE_RCV_TIMESTAMPS, config.generateReceiveTimestamps);
 
         // SSL/TLS — custom truststore (optional; falls back to JVM default when unset)
-        if (StringUtils.isNotBlank(sslTrustStorePath)) {
-            props.setProperty(JCSMPProperties.SSL_TRUST_STORE, sslTrustStorePath);
-            if (StringUtils.isNotBlank(sslTrustStorePassword)) {
-                props.setProperty(JCSMPProperties.SSL_TRUST_STORE_PASSWORD, sslTrustStorePassword);
+        if (StringUtils.isNotBlank(config.sslTrustStorePath)) {
+            props.setProperty(JCSMPProperties.SSL_TRUST_STORE, config.sslTrustStorePath);
+            if (StringUtils.isNotBlank(config.sslTrustStorePassword)) {
+                props.setProperty(JCSMPProperties.SSL_TRUST_STORE_PASSWORD, config.sslTrustStorePassword);
             }
-            if (StringUtils.isNotBlank(sslTrustStoreFormat)) {
-                props.setProperty(JCSMPProperties.SSL_TRUST_STORE_FORMAT, sslTrustStoreFormat);
+            if (StringUtils.isNotBlank(config.sslTrustStoreFormat)) {
+                props.setProperty(JCSMPProperties.SSL_TRUST_STORE_FORMAT, config.sslTrustStoreFormat);
             }
         }
 
         // Only affect TLS connections.
-        props.setProperty(JCSMPProperties.SSL_VALIDATE_CERTIFICATE, sslValidateCertificate);
-        props.setProperty(JCSMPProperties.SSL_VALIDATE_CERTIFICATE_DATE, sslValidateCertificateDate);
+        props.setProperty(JCSMPProperties.SSL_VALIDATE_CERTIFICATE, config.sslValidateCertificate);
+        props.setProperty(JCSMPProperties.SSL_VALIDATE_CERTIFICATE_DATE, config.sslValidateCertificateDate);
+        props.setBooleanProperty(JCSMPProperties.SSL_VALIDATE_CERTIFICATE_HOST, config.sslValidateHostname);
 
         // Mutual TLS
-        if (StringUtils.isNotBlank(sslKeyStorePath)) {
-            props.setProperty(JCSMPProperties.SSL_KEY_STORE, sslKeyStorePath);
-            if (StringUtils.isNotBlank(sslKeyStorePassword)) {
-                props.setProperty(JCSMPProperties.SSL_KEY_STORE_PASSWORD, sslKeyStorePassword);
+        if (StringUtils.isNotBlank(config.sslKeyStorePath)) {
+            props.setProperty(JCSMPProperties.SSL_KEY_STORE, config.sslKeyStorePath);
+            if (StringUtils.isNotBlank(config.sslKeyStorePassword)) {
+                props.setProperty(JCSMPProperties.SSL_KEY_STORE_PASSWORD, config.sslKeyStorePassword);
             }
-            if (StringUtils.isNotBlank(sslKeyStoreFormat)) {
-                props.setProperty(JCSMPProperties.SSL_KEY_STORE_FORMAT, sslKeyStoreFormat);
+            if (StringUtils.isNotBlank(config.sslKeyStoreFormat)) {
+                props.setProperty(JCSMPProperties.SSL_KEY_STORE_FORMAT, config.sslKeyStoreFormat);
             }
-            if (StringUtils.isNotBlank(sslKeyPassword)) {
-                props.setProperty(JCSMPProperties.SSL_PRIVATE_KEY_PASSWORD, sslKeyPassword);
+            if (StringUtils.isNotBlank(config.sslKeyPassword)) {
+                props.setProperty(JCSMPProperties.SSL_PRIVATE_KEY_PASSWORD, config.sslKeyPassword);
             }
         }
 
@@ -541,12 +627,12 @@ public class SolaceEventListener extends GenericEventBasedConsumer implements XM
 
     private void applyAuthScheme(JCSMPProperties props) {
         if (SolaceInboundConstants.AUTH_SCHEME_CLIENT_CERTIFICATE
-                .equalsIgnoreCase(authScheme)) {
+                .equalsIgnoreCase(config.authScheme)) {
             props.setProperty(JCSMPProperties.AUTHENTICATION_SCHEME,
                     JCSMPProperties.AUTHENTICATION_SCHEME_CLIENT_CERTIFICATE);
             // JCSMP requires a non-null USERNAME to build the SMF login frame, even when authentication is by client certificate.
-            if (apiProvidedUsername != null && !apiProvidedUsername.trim().isEmpty()) {
-                props.setProperty(JCSMPProperties.USERNAME, apiProvidedUsername);
+            if (config.apiProvidedUsername != null && !config.apiProvidedUsername.trim().isEmpty()) {
+                props.setProperty(JCSMPProperties.USERNAME, config.apiProvidedUsername);
             } else {
                // No username supplied: use a non-null placeholder so JCSMP can build the login frame.
                // Under the default broker config (username-source=common-name) the identity is derived
@@ -554,17 +640,18 @@ public class SolaceEventListener extends GenericEventBasedConsumer implements XM
                props.setProperty(JCSMPProperties.USERNAME, SolaceInboundConstants.PLACEHOLDER_USERNAME);
             }
         } else if (SolaceInboundConstants.AUTH_SCHEME_OAUTH2
-                .equalsIgnoreCase(authScheme)) {
+                .equalsIgnoreCase(config.authScheme)) {
             props.setProperty(JCSMPProperties.AUTHENTICATION_SCHEME,
                     JCSMPProperties.AUTHENTICATION_SCHEME_OAUTH2);
-            if (oauth2AccessToken != null) {
-                props.setProperty(JCSMPProperties.OAUTH2_ACCESS_TOKEN, oauth2AccessToken);
+            String accessToken = tokenSource.current();
+            if (accessToken != null) {
+                props.setProperty(JCSMPProperties.OAUTH2_ACCESS_TOKEN, accessToken);
             }
-            if (oauth2IssuerIdentifier != null) {
-                props.setProperty(JCSMPProperties.OAUTH2_ISSUER_IDENTIFIER, oauth2IssuerIdentifier);
+            if (config.oauth2IssuerIdentifier != null) {
+                props.setProperty(JCSMPProperties.OAUTH2_ISSUER_IDENTIFIER, config.oauth2IssuerIdentifier);
             }
-            if (oidcIdToken != null) {
-                props.setProperty(JCSMPProperties.OIDC_ID_TOKEN, oidcIdToken);
+            if (config.oidcIdToken != null) {
+                props.setProperty(JCSMPProperties.OIDC_ID_TOKEN, config.oidcIdToken);
             }
             // Non-null placeholder so JCSMP can build the login frame (it NPEs on a null USERNAME).
             // Under OAuth2 the broker authenticates from the OAUTH2_ACCESS_TOKEN / OIDC_ID_TOKEN set
@@ -573,196 +660,6 @@ public class SolaceEventListener extends GenericEventBasedConsumer implements XM
         } else {
             props.setProperty(JCSMPProperties.AUTHENTICATION_SCHEME,
                     JCSMPProperties.AUTHENTICATION_SCHEME_BASIC);
-        }
-    }
-
-    private ConsumerFlowProperties buildFlowProperties(Endpoint endpoint) {
-        ConsumerFlowProperties flowProps = new ConsumerFlowProperties();
-        flowProps.setEndpoint(endpoint);
-        flowProps.setAckMode(autoAck
-                ? JCSMPProperties.SUPPORTED_MESSAGE_ACK_AUTO
-                : JCSMPProperties.SUPPORTED_MESSAGE_ACK_CLIENT);
-        if (!autoAck) {
-            // Declare negative outcomes up front so settle(FAILED)/settle(REJECTED) is allowed —
-            // either from handleFailedMessage here or from the Solace connector's NACK operation.
-            flowProps.addRequiredSettlementOutcomes(
-                    XMLMessage.Outcome.FAILED, XMLMessage.Outcome.REJECTED);
-        }
-        if (selector != null && !selector.trim().isEmpty()) {
-            flowProps.setSelector(selector.trim());
-        }
-        return flowProps;
-    }
-
-    /**
-     * Builds EndpointProperties for queue/DTE provisioning from user config.
-     */
-    private EndpointProperties buildEndpointProperties() {
-        EndpointProperties endpointProps = new EndpointProperties();
-        if (SolaceInboundConstants.QUEUE_ACCESS_NON_EXCLUSIVE.equalsIgnoreCase(queueAccessType)) {
-            endpointProps.setAccessType(EndpointProperties.ACCESSTYPE_NONEXCLUSIVE);
-        } else {
-            endpointProps.setAccessType(EndpointProperties.ACCESSTYPE_EXCLUSIVE);
-        }
-        if ("CONSUME".equalsIgnoreCase(queuePermission)) {
-            endpointProps.setPermission(EndpointProperties.PERMISSION_CONSUME);
-        } else if ("DELETE".equalsIgnoreCase(queuePermission)) {
-            endpointProps.setPermission(EndpointProperties.PERMISSION_DELETE);
-        } else if ("MODIFY_TOPIC".equalsIgnoreCase(queuePermission)) {
-            endpointProps.setPermission(EndpointProperties.PERMISSION_MODIFY_TOPIC);
-        } else if ("READ_ONLY".equalsIgnoreCase(queuePermission)) {
-            endpointProps.setPermission(EndpointProperties.PERMISSION_READ_ONLY);
-        }
-        if (queueQuotaMB > 0) {
-            endpointProps.setQuota(queueQuotaMB);
-        }
-        if (queueMaxMsgSize > 0) {
-            endpointProps.setMaxMsgSize(queueMaxMsgSize);
-        }
-        endpointProps.setRespectsMsgTTL(queueRespectTTL);
-        if (queueMaxMsgRedelivery > 0) {
-            endpointProps.setMaxMsgRedelivery(queueMaxMsgRedelivery);
-        }
-        return endpointProps;
-    }
-
-    @Override
-    public void onReceive(BytesXMLMessage message) {
-        if (injectHandler == null) {
-            log.warn("injectHandler null, cannot process message.");
-            return;
-        }
-
-        if (log.isDebugEnabled()) {
-             log.debug("Received message with HTTP content type: " + message.getHTTPContentType()
-                     + " and content: " + message.hasContent()
-                     + " and binary payload as base64: " + binaryPayloadAsBase64);
-        }
-
-        SolaceInjectHandler.InjectionOutcome outcome = injectHandler.injectMessage(message);
-
-        if (!autoAck) {
-            switch (outcome) {
-                case SUCCESS:
-                    message.ackMessage();
-                    break;
-                case FAILED:
-                    handleFailedMessage(message);
-                    break;
-                case REJECTED:
-                    rejectMessage(message);
-                    break;
-                case ALREADY_SETTLED:
-                    // acknowledgeMessage / nackMessage already settled this message during
-                    // mediation. Settling again would conflict with the broker's redelivery
-                    // tracking and (for FAILED outcomes) cause infinite redelivery.
-                    break;
-            }
-        }
-    }
-
-    private void handleFailedMessage(BytesXMLMessage message) {
-        try {
-            if (SolaceInboundConstants.FAILURE_OUTCOME_FAILED
-                    .equalsIgnoreCase(failureOutcome)) {
-                message.settle(XMLMessage.Outcome.FAILED);
-                log.warn("Settled message [" + message.getMessageId()
-                        + "] as FAILED (will be redelivered).");
-            } else if (SolaceInboundConstants.FAILURE_OUTCOME_REJECTED
-                    .equalsIgnoreCase(failureOutcome)) {
-                message.settle(XMLMessage.Outcome.REJECTED);
-                log.warn("Settled message [" + message.getMessageId()
-                        + "] as REJECTED (routed to DMQ).");
-            } else {
-                log.warn("Injection failed for message [" + message.getMessageId()
-                        + "], redelivered=" + message.getRedelivered()
-                        + ". No ACK — broker redelivery limit applies.");
-            }
-        } catch (JCSMPException e) {
-            log.error("Failed to settle message [" + message.getMessageId() + "]", e);
-        }
-    }
-
-    /**
-     * Settles a message as REJECTED so the broker routes it to the DMQ. Used for messages that can
-     * never be processed (e.g. empty payload) — unlike the configurable failureOutcome path, this
-     * is always REJECTED: it preserves the full message for inspection without redelivery.
-     */
-    private void rejectMessage(BytesXMLMessage message) {
-        try {
-            message.settle(XMLMessage.Outcome.REJECTED);
-            log.warn("Settled message [" + message.getMessageId()
-                    + "] as REJECTED (routed to DMQ).");
-        } catch (JCSMPException e) {
-            log.error("Failed to settle message [" + message.getMessageId() + "]", e);
-        }
-    }
-
-    /**
-     * Called by JCSMP when all internal reconnect retries are exhausted.
-     */
-    @Override
-    public void onException(JCSMPException exception) {
-        log.error("SolaceListener [" + name + "] encountered an error", exception);
-        onTerminalFailure.run();
-    }
-
-    /**
-     * Handles a terminal failure reported by onException, session DOWN_ERROR or a terminal FLOW_DOWN:
-     * tears the listener down once and asks the MI inbound framework to call listen() again, which it
-     * keeps retrying until the listener is back. On MI versions without that support the listener stays
-     * down until the inbound endpoint is re-activated, as before.
-     *
-     * <p>A failure is bound to the session it was reported for. Several events for the same failure are
-     * handled once ({@code handled}), and a failure of a session that listen() has since replaced is
-     * ignored, while a failure of the replacement itself, even while it is still starting, is handled.
-     *
-     * <p>Failures are reported on JCSMP callback threads. destroy() calls session.closeSession(), which
-     * waits for all active callbacks to return — including the reporting one — so calling it inline
-     * would deadlock. The teardown therefore runs on a short-lived daemon thread.
-     */
-    private void handleTerminalFailure(int generation, AtomicBoolean handled) {
-        if (generation != sessionGeneration) {
-            if (log.isDebugEnabled()) {
-                log.debug("SolaceListener [" + name + "] ignoring a failure reported for an earlier session.");
-            }
-            return;
-        }
-        if (!handled.compareAndSet(false, true)) {
-            return;
-        }
-        Thread recovery = new Thread(() -> recover(generation), "solace-recovery-" + name);
-        recovery.setDaemon(true);
-        recovery.start();
-    }
-
-    /**
-     * Recovery worker for a failed session: tears the listener down, then asks the MI inbound framework
-     * to listen again. The generation is re-checked under the listener monitor immediately before
-     * destroy(), as this thread may only get to run after a deactivate/activate cycle has already
-     * replaced the failed session with a healthy one, which must not be closed.
-     */
-    void recover(int generation) {
-        try {
-            synchronized (this) {
-                if (generation != sessionGeneration) {
-                    log.info("SolaceListener [" + name + "] failed session was already replaced, "
-                            + "no recovery needed.");
-                    return;
-                }
-                destroy();
-            }
-            log.info("SolaceListener [" + name + "] requesting a restart from the MI inbound framework.");
-            try {
-                requestRelisten();
-            } catch (NoSuchMethodError e) {
-                // MI versions without requestRelisten(): keep the previous behaviour, the listener
-                // stays down until the inbound endpoint is re-activated.
-                log.warn("SolaceListener [" + name + "] cannot be restarted automatically on this MI "
-                        + "version. Re-activate the inbound endpoint to resume consumption.");
-            }
-        } catch (Exception e) {
-            log.error("Error while recovering SolaceListener [" + name + "]", e);
         }
     }
 }

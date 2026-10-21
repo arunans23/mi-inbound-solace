@@ -186,7 +186,7 @@
           {
             "type": "attribute",
             "value": {
-              "name": "apiProvidedUsername",
+              "name": "solace.apiProvidedUsername",
               "displayName": "API-Provided Username",
               "inputType": "string",
               "defaultValue": "",
@@ -265,12 +265,45 @@
           {
             "type": "attribute",
             "value": {
+              "name": "solace.oauth2TokenFile",
+              "displayName": "OAuth2 Token File",
+              "inputType": "string",
+              "defaultValue": "",
+              "required": false,
+              "helpTip": "File the OAuth2 access token is read from at every connect and reconnect, so that a sidecar or an operator can rotate it, and it requires the OAUTH2 authentication scheme."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
               "name": "solace.clientName",
               "displayName": "Client Name",
               "inputType": "string",
               "defaultValue": "",
               "required": false,
-              "helpTip": "Optional client name for the JCSMP session. If empty, the broker assigns one automatically."
+              "helpTip": "Client name prefix. Empty gives the node and endpoint name. Set solace.clientNameStrict to use it as given."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.clientNameStrict",
+              "displayName": "Client Name Strict",
+              "inputType": "boolean",
+              "defaultValue": false,
+              "required": false,
+              "helpTip": "When false the session name is the client name, if set, followed by the node id and the endpoint name, so that a rebuilt session evicts its old one, and when true the client name is sent unchanged as in 1.x."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.compressionLevel",
+              "displayName": "Compression Level",
+              "inputType": "string",
+              "defaultValue": "0",
+              "required": false,
+              "helpTip": "Compression level of the connection from 0 to 9, where 0 turns compression off."
             }
           }
         ]
@@ -336,6 +369,17 @@
                 {"solace.subscriptionType": "DURABLE"}
               ],
               "helpTip": "Name of the Durable Topic Endpoint (DTE) for persistent topic subscriptions."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.sharedSubscriptionGroup",
+              "displayName": "Shared Subscription Group",
+              "inputType": "string",
+              "defaultValue": "",
+              "required": false,
+              "helpTip": "For a Direct topic with coordination=false, subscribes as #share/<group>/<topic> so that each message reaches one node."
             }
           }
         ]
@@ -408,7 +452,7 @@
               "inputType": "checkbox",
               "defaultValue": true,
               "required": false,
-              "helpTip": "Enabled by default: messages are auto-acknowledged on receipt and the mediation sequence cannot influence settlement. Disable this if you intend to call acknowledgeMessage / nackMessage from the sequence."
+              "helpTip": "Enabled by default. The message is acknowledged when the injection returns, at most once, and the sequence cannot settle it. Disable it to call acknowledgeMessage or nackMessage from the sequence."
             }
           },
           {
@@ -418,9 +462,9 @@
               "displayName": "Fallback Failure Outcome",
               "inputType": "combo",
               "comboValues": ["NONE", "FAILED", "REJECTED"],
-              "defaultValue": "NONE",
+              "defaultValue": "FAILED",
               "required": false,
-              "helpTip": "Fallback settlement used only when the sequence does not call ack/nack itself (e.g. unhandled exception or injection failure). Ignored when autoAck is on. NONE: leave unsettled (broker redelivers after timeout). FAILED: redeliver immediately. REJECTED: route straight to DMQ."
+              "helpTip": "Outcome applied when no settlement arrives within the settlement timeout, where FAILED retries the message in place as solace.maxRedeliveries allows, REJECTED routes it to the DMQ and NONE leaves it unsettled and counts it as retainedUnsettled."
             }
           },
           {
@@ -432,6 +476,129 @@
               "defaultValue": "255",
               "required": false,
               "helpTip": "Number of guaranteed messages the broker can have in flight before it must receive an acknowledgement. Default 255 suits most cases; raise for higher throughput, lower for stricter ordering or memory-constrained consumers."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.settlementTimeout",
+              "displayName": "Settlement Timeout (ms)",
+              "inputType": "string",
+              "defaultValue": "",
+              "required": false,
+              "helpTip": "Time the inbound waits for the sequence to settle a message before solace.failureOutcome applies. Empty uses the deployment.toml value [messaging_callback] solace_inbound_settlement_timeout_ms, or 180000 ms."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.concurrentConsumers",
+              "displayName": "Concurrent Consumers",
+              "inputType": "string",
+              "defaultValue": "1",
+              "required": false,
+              "helpTip": "Number of workers that process messages at the same time, where 1 keeps the order of delivery attempts strict together with the in place retry."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.maxRedeliveries",
+              "displayName": "Max Redeliveries",
+              "inputType": "string",
+              "defaultValue": "-1",
+              "required": false,
+              "helpTip": "In place retries of a failed message before it is rejected, where -1 retries without limit and 0 settles it FAILED at once so that the broker redelivery settings apply."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.redelivery.initialDelay",
+              "displayName": "Redelivery Initial Delay (ms)",
+              "inputType": "string",
+              "defaultValue": "1000",
+              "required": false,
+              "helpTip": "Delay in milliseconds before the first in place retry, and in transacted mode before the rollback."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.redelivery.progression",
+              "displayName": "Redelivery Progression",
+              "inputType": "string",
+              "defaultValue": "2.0",
+              "required": false,
+              "helpTip": "Factor that multiplies the retry delay after each attempt."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.redelivery.maxDelay",
+              "displayName": "Redelivery Max Delay (ms)",
+              "inputType": "string",
+              "defaultValue": "60000",
+              "required": false,
+              "helpTip": "Upper limit in milliseconds of the delay between in place retries."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.requireSettlementOutcomes",
+              "displayName": "Require Settlement Outcomes",
+              "inputType": "combo",
+              "comboValues": ["AUTO", "TRUE"],
+              "defaultValue": "AUTO",
+              "required": false,
+              "helpTip": "AUTO requests the settlement outcomes the broker reports and, when a message needs a missing one, keeps it unsettled and reconnects so that the broker redelivers it, while TRUE fails the bind as 1.x did."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.transacted",
+              "displayName": "Transacted",
+              "inputType": "boolean",
+              "defaultValue": false,
+              "required": false,
+              "helpTip": "Consumes each message in its own local transaction that commits on ACK and rolls back otherwise, and cannot be combined with autoAck=true or a topic."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.drainTimeout",
+              "displayName": "Drain Timeout (ms)",
+              "inputType": "string",
+              "defaultValue": "30000",
+              "required": false,
+              "helpTip": "Upper limit in milliseconds of a pause, resume or undeploy, at least 3000, of which the last 2000 ms settle the messages still in flight."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.drainOutcome",
+              "displayName": "Drain Outcome",
+              "inputType": "combo",
+              "comboValues": ["NONE", "REJECTED"],
+              "defaultValue": "NONE",
+              "required": false,
+              "helpTip": "Outcome for messages still in flight when a drain reaches its settle budget, where NONE leaves them to broker redelivery and REJECTED routes them to the DMQ."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.queuePermission",
+              "displayName": "Queue Permission",
+              "inputType": "string",
+              "defaultValue": "",
+              "required": false,
+              "helpTip": "Permission the endpoint sets on a queue it provisions: CONSUME, DELETE, MODIFY_TOPIC or READ_ONLY."
             }
           }
         ]
@@ -482,9 +649,9 @@
               "name": "solace.reconnectRetries",
               "displayName": "Reconnect Retries",
               "inputType": "string",
-              "defaultValue": "3",
+              "defaultValue": "-1",
               "required": false,
-              "helpTip": "Number of times to retry after a connection loss."
+              "helpTip": "JCSMP session reconnect attempts after a connection loss, where -1 retries without limit."
             }
           },
           {
@@ -496,6 +663,72 @@
               "defaultValue": "3000",
               "required": false,
               "helpTip": "Wait time in milliseconds between reconnect attempts."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.recovery.initialDelay",
+              "displayName": "Recovery Initial Delay (ms)",
+              "inputType": "string",
+              "defaultValue": "1000",
+              "required": false,
+              "helpTip": "Delay in milliseconds before the inbound makes its first new connection attempt after a failure."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.recovery.progression",
+              "displayName": "Recovery Progression",
+              "inputType": "string",
+              "defaultValue": "2.0",
+              "required": false,
+              "helpTip": "Factor that multiplies the delay after each failed connection attempt."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.recovery.maxDelay",
+              "displayName": "Recovery Max Delay (ms)",
+              "inputType": "string",
+              "defaultValue": "60000",
+              "required": false,
+              "helpTip": "Upper limit in milliseconds of the delay between connection attempts."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.recovery.maxAttempts",
+              "displayName": "Recovery Max Attempts",
+              "inputType": "string",
+              "defaultValue": "-1",
+              "required": false,
+              "helpTip": "Connection attempts before the endpoint stops in FAILED, where -1 keeps trying without limit."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.keepAliveInterval",
+              "displayName": "Keep Alive Interval (ms)",
+              "inputType": "string",
+              "defaultValue": "",
+              "required": false,
+              "helpTip": "Interval in milliseconds between keep alive messages, at least 50, and empty keeps the JCSMP default."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.keepAliveLimit",
+              "displayName": "Keep Alive Limit",
+              "inputType": "string",
+              "defaultValue": "",
+              "required": false,
+              "helpTip": "Keep alive messages without a reply before the connection is closed, at least 1, and empty keeps the JCSMP default."
             }
           }
         ]
@@ -752,6 +985,17 @@
               "defaultValue": true,
               "required": false,
               "helpTip": "Validate the broker certificate's notBefore/notAfter dates. Set to false to accept an expired cert (lab use). Ignored when Validate Server Certificate is false."
+            }
+          },
+          {
+            "type": "attribute",
+            "value": {
+              "name": "solace.sslValidateHostname",
+              "displayName": "Validate Certificate Hostname",
+              "inputType": "boolean",
+              "defaultValue": true,
+              "required": false,
+              "helpTip": "Checks that the broker certificate was issued for the host the inbound connects to."
             }
           }
         ]
