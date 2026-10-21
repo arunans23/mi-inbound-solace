@@ -30,7 +30,7 @@ import java.util.List;
 import static org.wso2.carbon.inbound.solace.SolaceUtils.validateRequiredParam;
 
 /**
- * The binding of a transacted queue (design 7.9). There is no dispatcher in this mode. Each worker
+ * The binding of a transacted queue. There is no dispatcher in this mode. Each worker
  * owns its transacted session, flow and producer and receives synchronously, so the dispatcher and
  * the flow handler arguments of bind() are unused. The workers create their own flow handlers with
  * their index.

@@ -217,7 +217,7 @@ public final class SolaceInboundConstants {
     public static final String SOLACE_DELIVERY_ATTEMPT = "solace.deliveryAttempt";
     public static final String SOLACE_INBOUND_TX = "solace.inbound.tx";
     public static final String SOLACE_INBOUND_TX_PRODUCER = "solace.inbound.tx.producer";
-    // handle values written by the inbound (design 7.4)
+    // handle values written by the inbound
     public static final String VALUE_ACK = "ACK";
     public static final String VALUE_FAILED = "FAILED";
     public static final String VALUE_REJECTED = "REJECTED";

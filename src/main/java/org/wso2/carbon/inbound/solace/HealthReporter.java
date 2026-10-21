@@ -133,7 +133,7 @@ final class HealthReporter {
 
     synchronized String connectivityWord() {
         if (connectivity.isEmpty()) {
-            // No resource is known before the first bind of a generation and after a refusal at listen() (A50).
+            // No resource is known before the first bind of a generation and after a refusal at listen().
             return "disconnected";
         }
         for (String resourceConnectivity : connectivity.values()) {

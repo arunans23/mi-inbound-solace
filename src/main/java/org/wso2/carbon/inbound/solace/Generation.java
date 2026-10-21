@@ -54,7 +54,7 @@ final class Generation {
     // Lifecycle fields. SolaceEventListener.lifecycleLock guards them, and the volatile ones are read without it.
     volatile boolean retired = false;
     volatile boolean active = false;
-    // Set by Closer.submit before anything else, so a generation that lost at its barrier refuses its reconnect too (A41).
+    // Set by Closer.submit before anything else, so a generation that lost at its barrier refuses its reconnect too.
     volatile boolean closing = false;
     boolean claimed = false;
     ScheduledFuture<?> scheduled;

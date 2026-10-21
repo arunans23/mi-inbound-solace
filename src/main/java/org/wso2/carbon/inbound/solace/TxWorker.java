@@ -52,7 +52,7 @@ import static org.wso2.carbon.inbound.solace.SolaceInboundConstants.SOLACE_INBOU
 import static org.wso2.carbon.inbound.solace.SolaceInboundConstants.SOLACE_INBOUND_TX_PRODUCER;
 
 /**
- * One transacted worker of a generation (design 7.9). The worker thread owns one transacted session,
+ * One transacted worker of a generation. The worker thread owns one transacted session,
  * one flow it reads synchronously and one producer. It is the only thread that touches the three.
  * The closer closes the published set through {@link #closeResources()}, and the drain calls the non
  * blocking {@code flow.stop()} through {@link TransactedBinding#stop()}. Nothing else reaches them.
@@ -142,7 +142,7 @@ final class TxWorker implements Runnable {
             // A null listener makes the flow synchronous. A transacted flow has no settlement outcomes.
             resources.flow = resources.ts.createFlow(null, flowProperties, null,
                     new SolaceFlowEventHandler(listener, g, index));
-            // Requires the parent producer of the generation (1.6). The handler logs at DEBUG only.
+            // Requires the parent producer of the generation. The handler logs at DEBUG only.
             resources.producer = resources.ts.createProducer(new ProducerFlowProperties(),
                     new TxPublishEventHandler(listener, g, index));
         } catch (JCSMPException | RuntimeException e) {
@@ -274,7 +274,7 @@ final class TxWorker implements Runnable {
         CommandQueue commands = new CommandQueue(Thread.currentThread(), this::runCommand);
         this.handle = handle;
         this.commands = commands;
-        // Completion wakes the owner (D24).
+        // Completion wakes the owner.
         handle.whenComplete((result, failure) -> commands.wake());
         synchronized (g.admission) {
             g.inFlightHandles.put(handle, delivery);
@@ -325,7 +325,7 @@ final class TxWorker implements Runnable {
             complete(message, false, "uncertain");
             return;
         }
-        // FAILED, REJECTED (D12), the TIMEOUT mapping and a rejected injection all roll back.
+        // FAILED, REJECTED, the TIMEOUT mapping and a rejected injection all roll back.
         counters.applied(decision == Decision.NONE ? Decision.FAILED : decision).increment();
         boolean drainWon = CAUSE_DRAIN.equals(value) || g.draining;
         if (!drainWon) {
@@ -402,7 +402,7 @@ final class TxWorker implements Runnable {
         }
         // A connector completion. The test build returns the winner's instant and removes the record.
         Object instant = Hooks.get().point("metrics.completionNanos", handle);
-        // -1 means missing or ambiguous, and the commit sample is invalid (C.5).
+        // -1 means missing or ambiguous, and the commit sample is invalid.
         delivery.completionNanos = instant instanceof Long ? (Long) instant : -1L;
     }
 
@@ -441,7 +441,7 @@ final class TxWorker implements Runnable {
         }
         if (future != null && future.isCancelled()) {
             // The caller stopped waiting while the command ran, so its outcome is unknown to it.
-            // A cancel between the check above and FutureTask.run() lands here too, a spurious rollback in the safe direction (G4).
+            // A cancel between the check above and FutureTask.run() lands here too, a spurious rollback in the safe direction.
             uncertain = true;
             log.error("SolaceListener [" + name + "] message " + delivery.messageId
                     + ": a connector command was cut off while running; the transaction is uncertain and will be "
@@ -460,7 +460,7 @@ final class TxWorker implements Runnable {
     /** The completion table of design 7.9, owner thread. */
     private void complete(BytesXMLMessage message, boolean commit, String why) {
         if (g.retired) {
-            // The drain counted the delivery once (G19). This line counts nothing.
+            // The drain counted the delivery once. This line counts nothing.
             log.warn("SolaceListener [" + name + "] message " + message.getMessageId() + ": generation " + g.id
                     + " retired, the closer rolls the transaction back");
             return;
@@ -498,7 +498,7 @@ final class TxWorker implements Runnable {
             }
         } catch (RollbackException e) {
             // The broker rolled back and the session is kept. A commit the broker keeps refusing would loop without
-            // the redelivery back off (A49).
+            // the redelivery back off.
             counters.rolledBackByBroker.increment();
             log.warn("SolaceListener [" + name + "] message " + message.getMessageId()
                     + ": the broker rolled the transaction back; it will be redelivered", e);

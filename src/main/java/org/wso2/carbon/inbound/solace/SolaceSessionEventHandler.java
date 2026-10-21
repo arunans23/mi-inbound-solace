@@ -30,7 +30,7 @@ import org.apache.commons.logging.LogFactory;
 /**
  * JCSMP session event handler of one generation. It runs on JCSMP threads, returns at once and
  * makes no JCSMP call. Events from a retired generation are ignored. It also answers the reconnect
- * question of JCSMP: a generation that is retired or closing refuses its own reconnect (A41).
+ * question of JCSMP: a generation that is retired or closing refuses its own reconnect.
  */
 public class SolaceSessionEventHandler implements SessionEventHandler, JCSMPReconnectEventHandler {
 
@@ -92,7 +92,7 @@ public class SolaceSessionEventHandler implements SessionEventHandler, JCSMPReco
         }
     }
 
-    // The flags alone decide, never listener.current, so a generation that lost at its barrier is covered (A41).
+    // The flags alone decide, never listener.current, so a generation that lost at its barrier is covered.
     @Override
     public boolean preReconnect() {
         boolean allowed = !(g.retired || g.closing);

@@ -130,7 +130,7 @@ public class SolaceInjectHandler {
     }
 
     /**
-     * Worker thread. Never throws. sequential is always true (design 7.2).
+     * Worker thread. Never throws. sequential is always true.
      */
     public InjectionOutcome inject(MessageContext synCtx) {
         try {

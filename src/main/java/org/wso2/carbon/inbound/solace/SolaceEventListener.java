@@ -146,7 +146,7 @@ public class SolaceEventListener extends GenericEventBasedConsumer {
                     + "already exists' does not change an existing queue; confirm them on the broker");
         }
         if (config.clientNameStrict) {
-            // Strict mode sends the name verbatim, as 1.x did, and a duplicate name loops on evictions (A43).
+            // Strict mode sends the name verbatim, as 1.x did, and a duplicate name loops on evictions.
             log.warn("SolaceListener [" + name + "] clientNameStrict=true: the client name '" + config.clientName
                     + "' is sent as is; a second session with this name on the broker evicts this one and the two "
                     + "evict each other in turn; keep it unique per node");
@@ -301,8 +301,8 @@ public class SolaceEventListener extends GenericEventBasedConsumer {
     }
 
     // A parked message belongs to the flow that delivered it. Once that flow leaves the connected state the broker
-    // redelivers every unacknowledged message on the rebind, so the parked copies are stale (A44). JCSMP thread,
-    // no JCSMP call. stopped is left as it is, the next worker that finishes restarts the flow (1.7).
+    // redelivers every unacknowledged message on the rebind, so the parked copies are stale. JCSMP thread,
+    // no JCSMP call. stopped is left as it is, the next worker that finishes restarts the flow.
     void discardParked(Generation generation, String why) {
         int parked;
         synchronized (generation.admission) {
@@ -474,7 +474,7 @@ public class SolaceEventListener extends GenericEventBasedConsumer {
                     reconnectGuard.close();
                 }
             } catch (Exception e) {
-                // Quiet by A41 item 4. The session close that follows closes this consumer as well.
+                // Quiet on purpose. The session close that follows closes this consumer as well.
             }
             try {
                 JCSMPSession session = generation.session;
@@ -529,7 +529,7 @@ public class SolaceEventListener extends GenericEventBasedConsumer {
                     + "parameter or upgrade the broker");
         }
         if (!config.direct) {
-            // Never started and without a subscription. It only carries the reconnect handler to JCSMP (A41).
+            // Never started and without a subscription. It only carries the reconnect handler to JCSMP.
             // A Direct endpoint registers the same handler with its own consumer in DirectTopicBinding.bind.
             generation.reconnectGuard = generation.session.getMessageConsumer(sessionHandler);
         }
@@ -543,7 +543,7 @@ public class SolaceEventListener extends GenericEventBasedConsumer {
                 : ConsumerBinding.create(this, generation);
         health.bound(generation, config.transacted ? config.concurrentConsumers : 1, config.direct);
         if (config.transacted) {
-            // There is no dispatcher in transacted mode. Each worker receives synchronously on its own flow (2.2).
+            // There is no dispatcher in transacted mode. Each worker receives synchronously on its own flow.
             generation.binding.bind(null, null);
         } else {
             generation.binding.bind(new Dispatcher(this, generation),

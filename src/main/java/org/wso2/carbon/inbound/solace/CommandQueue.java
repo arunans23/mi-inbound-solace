@@ -25,7 +25,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 /**
- * The command queue of one delivered message (design 7.9). The worker creates it before the inject
+ * The command queue of one delivered message. The worker creates it before the inject
  * and places it on the context as an {@link Executor}. A connector operation submits its JCSMP work
  * here and waits for the result. The owner thread runs every command through its own runCommand,
  * inline when the caller is the owner itself.

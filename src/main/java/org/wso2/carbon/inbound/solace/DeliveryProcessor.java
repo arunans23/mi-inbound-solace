@@ -310,7 +310,7 @@ final class DeliveryProcessor {
         if (listener.config.direct) {
             return;
         }
-        // A42: a settle sent on a flow that is down or reconnecting never reaches the broker, which redelivers.
+        // A settle sent on a flow that is down or reconnecting never reaches the broker, which redelivers.
         String connectivity = listener.health.connectivityWord();
         if (decision != Decision.NONE && !"connected".equals(connectivity)) {
             log.error("SolaceListener [" + name + "] settling message " + message.getMessageId() + " as " + decision
