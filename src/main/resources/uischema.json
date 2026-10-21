@@ -292,7 +292,7 @@
               "inputType": "boolean",
               "defaultValue": false,
               "required": false,
-              "helpTip": "When false the session name is the client name, if set, followed by the node id and the endpoint name, so that a rebuilt session evicts its old one, and when true the client name is sent unchanged as in 1.x."
+              "helpTip": "When false the node id and the endpoint name are appended to the client name, so that a rebuilt session evicts its old one."
             }
           },
           {
