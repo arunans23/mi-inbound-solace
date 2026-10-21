@@ -294,7 +294,7 @@ final class TxWorker implements Runnable {
                 value = handle.complete(SettlementValues.record(CAUSE_INJECTION_REJECTED))
                         ? CAUSE_INJECTION_REJECTED : SettlementValues.cause(handle.getNow(null));
             } else {
-                // C.5: the measurement record exists before the handle is exposed. A rejected injection never creates one.
+                // The measurement record exists before the handle is exposed. A rejected injection never creates one.
                 Hooks.get().point("metrics.handleCreated", handle);
                 messageContext.setProperty(SOLACE_INBOUND_SETTLEMENT, handle);
                 messageContext.setProperty(SOLACE_INBOUND_TX, commands);
@@ -382,7 +382,7 @@ final class TxWorker implements Runnable {
             log.warn("SolaceListener [" + name + "] message " + message.getMessageId() + " not settled within "
                     + listener.config.settlementTimeoutMillis + " ms; rolling back");
         }
-        // C.5: the measurement record leaves on every decision path. A lost race reads the winner's instant.
+        // The measurement record leaves on every decision path. A lost race reads the winner's instant.
         if (won) {
             Hooks.get().point("metrics.handleDiscard", handle);
         } else {
@@ -457,7 +457,7 @@ final class TxWorker implements Runnable {
         }
     }
 
-    /** The completion table of design 7.9, owner thread. */
+    /** The completion of one delivery, commit or rollback, owner thread. */
     private void complete(BytesXMLMessage message, boolean commit, String why) {
         if (g.retired) {
             // The drain counted the delivery once. This line counts nothing.
@@ -469,7 +469,7 @@ final class TxWorker implements Runnable {
         try {
             Hooks.get().point("txworker.beforeCommit", g, commit);
             if (commit) {
-                // C.5: commits only, with the completing side's instant, recorded after the hook so an injected delay is inside the duration.
+                // Measured for commits only, with the completing side's instant, recorded after the hook so an injected delay is inside the duration.
                 if (delivery.completionNanos > 0) {
                     Hooks.get().record("tx.completionToCommitStart", System.nanoTime() - delivery.completionNanos);
                 } else {

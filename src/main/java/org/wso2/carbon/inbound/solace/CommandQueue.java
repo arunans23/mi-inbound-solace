@@ -68,7 +68,7 @@ final class CommandQueue implements Executor {
         q.offer(WAKE);
     }
 
-    /** A zero or negative wait still returns an available item (Java contract, design 7.9). */
+    /** A zero or negative wait still returns an available item (the Java contract). */
     Object poll(long millis) throws InterruptedException {
         return q.poll(Math.max(0, millis), TimeUnit.MILLISECONDS);
     }
