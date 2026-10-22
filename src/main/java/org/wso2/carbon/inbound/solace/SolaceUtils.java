@@ -35,9 +35,7 @@ import org.apache.axiom.om.util.AXIOMUtil;
 import org.apache.axiom.soap.SOAPEnvelope;
 import org.apache.axiom.soap.SOAPFactory;
 import org.apache.axis2.context.MessageContext;
-import org.apache.commons.lang.BooleanUtils;
 import org.apache.commons.lang.StringUtils;
-import org.apache.commons.lang.math.NumberUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.synapse.SynapseException;
@@ -51,8 +49,8 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
-import java.util.Properties;
 
 public class SolaceUtils {
 
@@ -292,14 +290,58 @@ public class SolaceUtils {
         }
     }
 
-    public static int getIntProperty(Properties properties, String key, int defaultValue) {
-        return NumberUtils.toInt(properties.getProperty(key), defaultValue);
+    public static int parseInt(String value, String name, int defaultValue, List<String> errors) {
+        if (StringUtils.isBlank(value)) {
+            return defaultValue;
+        }
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            errors.add("invalid value '" + value + "' for " + name);
+            return defaultValue;
+        }
     }
 
-    public static boolean getBooleanProperty(Properties properties, String key,
-                                             boolean defaultValue) {
-        return BooleanUtils.toBooleanDefaultIfNull(
-                BooleanUtils.toBooleanObject(properties.getProperty(key)),
-                defaultValue);
+    public static long parseLong(String value, String name, long defaultValue, List<String> errors) {
+        if (StringUtils.isBlank(value)) {
+            return defaultValue;
+        }
+        try {
+            return Long.parseLong(value.trim());
+        } catch (NumberFormatException e) {
+            errors.add("invalid value '" + value + "' for " + name);
+            return defaultValue;
+        }
+    }
+
+    public static double parseDouble(String value, String name, double defaultValue, List<String> errors) {
+        if (StringUtils.isBlank(value)) {
+            return defaultValue;
+        }
+        try {
+            double parsed = Double.parseDouble(value.trim());
+            if (!Double.isFinite(parsed)) {
+                throw new NumberFormatException(value);
+            }
+            return parsed;
+        } catch (NumberFormatException e) {
+            errors.add("invalid value '" + value + "' for " + name);
+            return defaultValue;
+        }
+    }
+
+    public static boolean parseBoolean(String value, String name, boolean defaultValue, List<String> errors) {
+        if (StringUtils.isBlank(value)) {
+            return defaultValue;
+        }
+        String trimmed = value.trim();
+        if ("true".equalsIgnoreCase(trimmed)) {
+            return true;
+        }
+        if ("false".equalsIgnoreCase(trimmed)) {
+            return false;
+        }
+        errors.add("invalid value '" + value + "' for " + name);
+        return defaultValue;
     }
 }

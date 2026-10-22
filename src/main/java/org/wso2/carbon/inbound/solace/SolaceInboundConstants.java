@@ -76,8 +76,9 @@ public final class SolaceInboundConstants {
     // Consumer parameters
     public static final String AUTO_ACK = "solace.autoAck";
     public static final String SUB_ACK_WINDOW_SIZE = "solace.subAckWindowSize";
-    /** On injection failure: NONE (skip ack, let redelivery limit decide),
-     *  FAILED (settle as FAILED → redeliver), REJECTED (settle as REJECTED → DMQ). */
+    /** Applied when no settlement arrives within solace.settlementTimeout. NONE leaves the message unsettled,
+     *  FAILED settles it FAILED so the broker redelivers it, REJECTED settles it REJECTED so the broker moves it
+     *  to the DMQ. */
     public static final String FAILURE_OUTCOME = "solace.failureOutcome";
     public static final String FAILURE_OUTCOME_NONE = "NONE";
     public static final String FAILURE_OUTCOME_FAILED = "FAILED";
@@ -138,7 +139,7 @@ public final class SolaceInboundConstants {
     public static final String SOLACE_EXPIRATION = "solace.expiration";
     public static final String SOLACE_DISCARD_INDICATION = "solace.discardIndication";
 
-    // --- Guaranteed delivery only (PERSISTENT / NON_PERSISTENT) ---
+    // --- Set on every message, deliveryCount only when the broker enables it ---
     public static final String SOLACE_REDELIVERED = "solace.redelivered";
     public static final String SOLACE_DELIVERY_COUNT = "solace.deliveryCount";
 
@@ -170,19 +171,59 @@ public final class SolaceInboundConstants {
     public static final String SOLACE_INBOUND_MESSAGE = "solace.inbound.message";
 
     /**
-     * Set to {@code Boolean.TRUE} by acknowledgeMessage / nackMessage after they settle the
-     * inbound JCSMP message. The listener checks this after mediation and skips its own
-     * post-mediation ack/nack so the broker doesn't see a conflicting second settlement
-     * (which corrupts redelivery counting and can cause infinite redelivery). Must match
-     * {@code SolaceConstants.SOLACE_INBOUND_MESSAGE_SETTLED} in the connector module.
-     */
-    public static final String SOLACE_INBOUND_MESSAGE_SETTLED = "solace.inbound.message.settled";
-
-    /**
      * Prefix for user-defined properties carried in the Solace SDTMap
      * ({@code message.getProperties()}).
      * Each key is surfaced as {@code solace.userProp.<key>} on the MessageContext.
      * For example, a user property named "region" becomes "solace.userProp.region".
      */
     public static final String SOLACE_USER_PROP_PREFIX = "solace.userProp.";
+
+    // 2.0.0 parameters
+    public static final String SETTLEMENT_TIMEOUT = "solace.settlementTimeout";
+    public static final String CONCURRENT_CONSUMERS = "solace.concurrentConsumers";
+    public static final String DRAIN_TIMEOUT = "solace.drainTimeout";
+    public static final String DRAIN_OUTCOME = "solace.drainOutcome";
+    public static final String REDELIVERY_INITIAL_DELAY = "solace.redelivery.initialDelay";
+    public static final String REDELIVERY_PROGRESSION = "solace.redelivery.progression";
+    public static final String REDELIVERY_MAX_DELAY = "solace.redelivery.maxDelay";
+    public static final String MAX_REDELIVERIES = "solace.maxRedeliveries";
+    public static final String RECOVERY_INITIAL_DELAY = "solace.recovery.initialDelay";
+    public static final String RECOVERY_PROGRESSION = "solace.recovery.progression";
+    public static final String RECOVERY_MAX_DELAY = "solace.recovery.maxDelay";
+    public static final String RECOVERY_MAX_ATTEMPTS = "solace.recovery.maxAttempts";
+    public static final String SHARED_SUBSCRIPTION_GROUP = "solace.sharedSubscriptionGroup";
+    public static final String TRANSACTED = "solace.transacted";
+    public static final String CLIENT_NAME_STRICT = "solace.clientNameStrict";
+    public static final String SSL_VALIDATE_HOSTNAME = "solace.sslValidateHostname";
+    public static final String COMPRESSION_LEVEL = "solace.compressionLevel";
+    public static final String KEEP_ALIVE_INTERVAL = "solace.keepAliveInterval";
+    public static final String KEEP_ALIVE_LIMIT = "solace.keepAliveLimit";
+    public static final String OAUTH2_TOKEN_FILE = "solace.oauth2TokenFile";
+    public static final String REQUIRE_SETTLEMENT_OUTCOMES = "solace.requireSettlementOutcomes";
+    public static final String API_PROVIDED_USERNAME_PREFIXED = "solace.apiProvidedUsername";   // old name API_PROVIDED_USERNAME still accepted
+    public static final String DRAIN_OUTCOME_NONE = "NONE";
+    public static final String DRAIN_OUTCOME_REJECTED = "REJECTED";
+    public static final String REQUIRE_OUTCOMES_AUTO = "AUTO";
+    public static final String REQUIRE_OUTCOMES_TRUE = "TRUE";
+    public static final String DEFAULT_SETTLEMENT_TIMEOUT_MS = "180000";
+    public static final String TOML_MESSAGING_CALLBACK = "messaging_callback";
+    public static final String TOML_SETTLEMENT_TIMEOUT_KEY = "solace_inbound_settlement_timeout_ms";
+    public static final int MIN_DRAIN_TIMEOUT_MS = 3000;
+    public static final int SETTLE_BUDGET_MS = 2000;
+    public static final int DIRECT_PENDING_LIMIT = 1000;
+    public static final int MAX_CLIENT_NAME_BYTES = 160;
+    // context properties
+    public static final String SOLACE_INBOUND_SETTLEMENT = "solace.inbound.settlement";
+    public static final String SOLACE_DELIVERY_ATTEMPT = "solace.deliveryAttempt";
+    public static final String SOLACE_INBOUND_TX = "solace.inbound.tx";
+    public static final String SOLACE_INBOUND_TX_PRODUCER = "solace.inbound.tx.producer";
+    // handle values written by the inbound
+    public static final String VALUE_ACK = "ACK";
+    public static final String VALUE_FAILED = "FAILED";
+    public static final String VALUE_REJECTED = "REJECTED";
+    public static final String CAUSE_TIMEOUT = "TIMEOUT";
+    public static final String CAUSE_DRAIN = "DRAIN";
+    public static final String CAUSE_INJECTION_REJECTED = "INJECTION_REJECTED";
+    public static final String CAUSE_AUTOACK = "AUTOACK";
+    public static final String CAUSE_OTHER = "OTHER";
 }

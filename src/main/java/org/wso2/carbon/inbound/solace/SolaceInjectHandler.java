@@ -28,6 +28,7 @@ import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.synapse.Mediator;
+import org.apache.synapse.MessageContext;
 import org.apache.synapse.SynapseConstants;
 import org.apache.synapse.aspects.flow.statistics.collectors.RuntimeStatisticCollector;
 import org.apache.synapse.aspects.flow.statistics.tracing.opentelemetry.management.handling.span.SpanHandler;
@@ -46,22 +47,11 @@ public class SolaceInjectHandler {
     private static final Log log = LogFactory.getLog(SolaceInjectHandler.class);
 
     /**
-     * Outcome of an injection attempt. The listener uses this to decide whether to settle
-     * the JCSMP message itself after mediation returns.
+     * Outcome of an injection attempt.
      */
     public enum InjectionOutcome {
-        /** Mediation completed without an injection-time exception. Listener should ack. */
         SUCCESS,
-        /** Injection failed with an exception. Listener should apply its failureOutcome policy. */
-        FAILED,
-        /**
-         * The message can never be processed (e.g. empty/unparseable payload). Listener should
-         * settle it as REJECTED so the broker routes it to the DMQ — this preserves the full
-         * message for inspection without triggering redelivery (which would loop forever).
-         */
-        REJECTED,
-        /** A connector op (acknowledgeMessage / nackMessage) already settled the message during mediation. */
-        ALREADY_SETTLED
+        FAILED
     }
 
     private final String injectingSequence;
@@ -94,83 +84,73 @@ public class SolaceInjectHandler {
         this.inboundEndpointName = inboundEndpointName;
     }
 
-    public InjectionOutcome injectMessage(BytesXMLMessage message) {
-        org.apache.synapse.MessageContext synCtx = null;
+    /**
+     * Worker thread. Returns null for an empty payload (logged WARN), throws for any other build failure.
+     */
+    public MessageContext buildContext(BytesXMLMessage message, int attempt) throws Exception {
+        String payload = SolaceUtils.extractPayload(message, binaryPayloadAsBase64);
+        if (payload == null || payload.isEmpty()) {
+            log.warn("Received empty Solace message, rejecting (routed to DMQ).");
+            return null;
+        }
+
+        MessageContext synCtx = SolaceUtils.createMessageContext(
+                synapseEnvironment, payload, message, contentType, binaryPayloadAsBase64);
+
+        // Names the mediation flow's entry span after the inbound endpoint.
+        synCtx.setProperty(SynapseConstants.INBOUND_ENDPOINT_NAME, inboundEndpointName);
+
+        if (RuntimeStatisticCollector.isOpenTelemetryEnabled()) {
+            try {
+                SpanHandler.extractTraceContextAndInjectToMessageContext(message, synCtx, TRACE_CONTEXT_GETTER);
+            } catch (NoSuchMethodError e) {
+                log.warn("You are running solace inbound connector on old wso2mi version. " +
+                        "Distributed tracing will not working correctly in this version. " +
+                        "Please upgrade the wso2mi version");
+            }
+        }
+        // Stash the raw JCSMP message so sendReply / acknowledgeMessage / nackMessage
+        // can access the original handle from the mediation flow.
+        synCtx.setProperty(SolaceInboundConstants.SOLACE_INBOUND_MESSAGE, message);
+
+        setMessageProperties(synCtx, message);
+        synCtx.setProperty(SolaceInboundConstants.SOLACE_DELIVERY_ATTEMPT, String.valueOf(attempt));
+        synCtx.setProperty(SolaceInboundConstants.SOLACE_REDELIVERED,
+                String.valueOf(message.getRedelivered() || attempt > 1));
+
+        // Wire up the error sequence via pushFaultHandler so it is actually invoked on errors
+        if (StringUtils.isNotEmpty(onErrorSequence)) {
+            Mediator errorSeq = synapseEnvironment
+                    .getSynapseConfiguration().getSequence(onErrorSequence);
+            if (errorSeq != null) {
+                synCtx.pushFaultHandler(new MediatorFaultHandler(errorSeq));
+            }
+        }
+        return synCtx;
+    }
+
+    /**
+     * Worker thread. Never throws. sequential is always true.
+     */
+    public InjectionOutcome inject(MessageContext synCtx) {
         try {
-            String payload = SolaceUtils.extractPayload(message, binaryPayloadAsBase64);
-            if (payload == null || payload.isEmpty()) {
-                // Nothing to inject. Reject rather than ack so the message (with its headers /
-                // user properties intact) is preserved in the DMQ for inspection. Acking would
-                // silently drop it; FAILED would redeliver the same empty payload forever.
-                log.warn("Received empty Solace message, rejecting (routed to DMQ).");
-                return InjectionOutcome.REJECTED;
-            }
-
-            synCtx = SolaceUtils.createMessageContext(
-                    synapseEnvironment, payload, message, contentType, binaryPayloadAsBase64);
-
-            // Names the mediation flow's entry span after the inbound endpoint.
-            synCtx.setProperty(SynapseConstants.INBOUND_ENDPOINT_NAME, inboundEndpointName);
-
-            if (RuntimeStatisticCollector.isOpenTelemetryEnabled()) {
-                try {
-                    SpanHandler.extractTraceContextAndInjectToMessageContext(message, synCtx, TRACE_CONTEXT_GETTER);
-                } catch (NoSuchMethodError e) {
-                    log.warn("You are running solace inbound connector on old wso2mi version. " +
-                            "Distributed tracing will not working correctly in this version. " +
-                            "Please upgrade the wso2mi version");
-                }
-            }
-            // Stash the raw JCSMP message so sendReply / acknowledgeMessage / nackMessage
-            // can access the original handle from the mediation flow.
-            synCtx.setProperty(SolaceInboundConstants.SOLACE_INBOUND_MESSAGE, message);
-
-            setMessageProperties(synCtx, message);
-
-            // Wire up the error sequence via pushFaultHandler so it is actually invoked on errors
-            if (StringUtils.isNotEmpty(onErrorSequence)) {
-                Mediator errorSeq = synapseEnvironment
-                        .getSynapseConfiguration().getSequence(onErrorSequence);
-                if (errorSeq != null) {
-                    synCtx.pushFaultHandler(new MediatorFaultHandler(errorSeq));
-                }
-            }
-
             if (StringUtils.isNotEmpty(injectingSequence)) {
                 SequenceMediator seq = (SequenceMediator) synapseEnvironment
                         .getSynapseConfiguration().getSequence(injectingSequence);
-                if (seq != null) {
-                    if (log.isDebugEnabled()) {
-                        log.debug("Injecting Solace message into sequence: " + injectingSequence);
-                    }
-                    synapseEnvironment.injectInbound(synCtx, seq, sequential);
-                } else {
+                if (seq == null) {
                     log.error("Sequence '" + injectingSequence + "' not found.");
                     return InjectionOutcome.FAILED;
                 }
+                if (log.isDebugEnabled()) {
+                    log.debug("Injecting Solace message into sequence: " + injectingSequence);
+                }
+                synapseEnvironment.injectInbound(synCtx, seq, true);
             } else {
                 synapseEnvironment.injectMessage(synCtx);
-            }
-
-            // A connector op (acknowledgeMessage / nackMessage) that ran during mediation settles
-            // the JCSMP message directly and sets SOLACE_INBOUND_MESSAGE_SETTLED=true on the
-            // context. Manual-ack mode is always sequential, so mediation has finished here and
-            // the flag is authoritative. When it is set, return ALREADY_SETTLED so onReceive skips
-            // its own post-mediation settle: settling twice would conflict with the broker's
-            // redelivery tracking — an ack after a connector nack drops the intended FAILED/
-            // REJECTED (redelivery / DMQ) outcome, and a redundant settle can cause infinite
-            // redelivery. (A second ack alone is a Solace no-op; the ack-then-nack case is the hazard.)
-            if (Boolean.TRUE.equals(
-                    synCtx.getProperty(SolaceInboundConstants.SOLACE_INBOUND_MESSAGE_SETTLED))) {
-                return InjectionOutcome.ALREADY_SETTLED;
             }
             return InjectionOutcome.SUCCESS;
         } catch (Exception e) {
             log.error("Error injecting Solace message into Synapse engine", e);
-            if (synCtx != null && Boolean.TRUE.equals(
-                    synCtx.getProperty(SolaceInboundConstants.SOLACE_INBOUND_MESSAGE_SETTLED))) {
-                return InjectionOutcome.ALREADY_SETTLED;
-            }
             return InjectionOutcome.FAILED;
         }
     }

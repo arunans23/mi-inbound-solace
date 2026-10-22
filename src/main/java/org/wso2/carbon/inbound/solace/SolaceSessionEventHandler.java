@@ -17,6 +17,9 @@
  */
 package org.wso2.carbon.inbound.solace;
 
+import com.solacesystems.jcsmp.JCSMPException;
+import com.solacesystems.jcsmp.JCSMPProperties;
+import com.solacesystems.jcsmp.JCSMPReconnectEventHandler;
 import com.solacesystems.jcsmp.SessionEvent;
 import com.solacesystems.jcsmp.SessionEventArgs;
 import com.solacesystems.jcsmp.SessionEventHandler;
@@ -25,42 +28,89 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 
 /**
- * Logs JCSMP session lifecycle events (RECONNECTING, RECONNECTED, DOWN_ERROR, ...) so operators
- * can observe reconnect activity, and drives listener teardown on terminal session failure.
- *
- * <p>{@code RECONNECTING}/{@code RECONNECTED} are transient — JCSMP is recovering the connection
- * on its own — so they are logged only. {@code DOWN_ERROR} is terminal (the session has failed and
- * will not reconnect); on that event the supplied {@code onSessionDown} callback is invoked so the
- * listener can tear itself down and ask the MI inbound framework to listen again. This complements the
- * {@code XMLMessageListener.onException} path: onException is JCSMP's documented signal for
- * permanent connection loss, but it is not guaranteed to fire for every terminal session-down case,
- * so reacting to DOWN_ERROR as well closes that gap. The listener handles a failure once, so if both
- * paths fire the second is a no-op.
+ * JCSMP session event handler of one generation. It runs on JCSMP threads, returns at once and
+ * makes no JCSMP call. Events from a retired generation are ignored. It also answers the reconnect
+ * question of JCSMP: a generation that is retired or closing refuses its own reconnect.
  */
-public class SolaceSessionEventHandler implements SessionEventHandler {
+public class SolaceSessionEventHandler implements SessionEventHandler, JCSMPReconnectEventHandler {
 
     private static final Log log = LogFactory.getLog(SolaceSessionEventHandler.class);
 
-    private final String listenerName;
-    private final Runnable onSessionDown;
+    private final SolaceEventListener listener;
+    private final Generation g;
+    private final SolaceInboundConfig config;
 
-    public SolaceSessionEventHandler(String listenerName, Runnable onSessionDown) {
-        this.listenerName = listenerName;
-        this.onSessionDown = onSessionDown;
+    SolaceSessionEventHandler(SolaceEventListener listener, Generation generation) {
+        this.listener = listener;
+        this.g = generation;
+        this.config = listener.config;
     }
 
     @Override
     public void handleEvent(SessionEventArgs eventArgs) {
+        if (g != listener.current) {
+            if (log.isDebugEnabled()) {
+                log.debug("SolaceListener [" + listener.name + "] session event from retired generation " + g.id
+                        + " ignored: " + eventArgs);
+            }
+            return;
+        }
         SessionEvent event = eventArgs.getEvent();
         if (event == SessionEvent.RECONNECTING) {
-            log.warn("SolaceListener [" + listenerName + "] session reconnecting: " + eventArgs);
+            if (SolaceInboundConstants.AUTH_SCHEME_OAUTH2.equalsIgnoreCase(config.authScheme)
+                    && config.oauth2TokenFile != null) {
+                // A local property update with no broker round trip, legal on the notification executor.
+                try {
+                    g.session.setProperty(JCSMPProperties.OAUTH2_ACCESS_TOKEN, listener.tokenSource.current());
+                } catch (JCSMPException e) {
+                    log.warn("SolaceListener [" + listener.name + "] could not update the OAuth2 token on the "
+                            + "reconnecting session", e);
+                }
+            }
+            log.warn("SolaceListener [" + listener.name + "] session reconnecting (generation " + g.id + "): "
+                    + eventArgs);
+            listener.health.sessionReconnecting(g, true);
         } else if (event == SessionEvent.RECONNECTED) {
-            log.info("SolaceListener [" + listenerName + "] session reconnected: " + eventArgs);
+            log.info("SolaceListener [" + listener.name + "] session reconnected (generation " + g.id + "): "
+                    + eventArgs);
+            listener.health.sessionReconnecting(g, false);
         } else if (event == SessionEvent.DOWN_ERROR) {
-            log.error("SolaceListener [" + listenerName + "] session DOWN (terminal): " + eventArgs);
-            onSessionDown.run();
+            log.error("SolaceListener [" + listener.name + "] session DOWN (terminal, generation " + g.id + "): "
+                    + eventArgs);
+            listener.terminalFailure(g, "session DOWN_ERROR", eventArgs.getException());
+        } else if (event == SessionEvent.SUBSCRIPTION_ERROR) {
+            if (config.direct) {
+                log.error("SolaceListener [" + listener.name + "] subscription error (terminal for a Direct topic, "
+                        + "generation " + g.id + "): " + eventArgs);
+                listener.terminalFailure(g, "subscription error", eventArgs.getException());
+            } else {
+                log.warn("SolaceListener [" + listener.name + "] subscription error (generation " + g.id + "): "
+                        + eventArgs);
+            }
         } else if (log.isDebugEnabled()) {
-            log.debug("SolaceListener [" + listenerName + "] session event: " + eventArgs);
+            log.debug("SolaceListener [" + listener.name + "] session event (generation " + g.id + "): " + eventArgs);
+        }
+    }
+
+    // The flags alone decide, never listener.current, so a generation that lost at its barrier is covered.
+    @Override
+    public boolean preReconnect() {
+        boolean allowed = !(g.retired || g.closing);
+        if (allowed) {
+            if (log.isDebugEnabled()) {
+                log.debug("SolaceListener [" + listener.name + "] reconnect allowed (generation " + g.id + ")");
+            }
+        } else {
+            log.warn("SolaceListener [" + listener.name + "] reconnect refused: generation " + g.id
+                    + " is retired or closing, the session stays down for the closer");
+        }
+        return allowed;
+    }
+
+    @Override
+    public void postReconnect() {
+        if (log.isDebugEnabled()) {
+            log.debug("SolaceListener [" + listener.name + "] reconnect completed (generation " + g.id + ")");
         }
     }
 }
